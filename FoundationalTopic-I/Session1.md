@@ -10,7 +10,7 @@ The system aims to track the online or offline status of users based on periodic
 
 - **Batch User Status (Preferred):** An API that fetches the statuses of multiple users in a single call `(GET /status/users?ids=u1,u2,u3)`. This is efficient for querying the status of multiple users at once.
 
-![plot](3.png)
+![plot](Pictures/3.png)
 
 ### 2. Updating user status: Push vs Pull Based Approach
 
@@ -37,7 +37,7 @@ When updating the user status in the database, we have two approaches to conside
 
 In our use case `Push-Based Approach` is much fesible. 
 
-![plot](4.png)
+![plot](Pictures/4.png)
 
 
 ## DataBase Design
@@ -81,7 +81,7 @@ To check the online/offline status of users, the GET request process changes sli
     - If the last heartbeat was received within the last 10 seconds, the user is marked online.
     - If no heartbeat has been received in the last 10 seconds, the user is marked offline
 
-![plot](6.png)
+![plot](Pictures/6.png)
 
 ## Storage requirements
 
@@ -97,7 +97,7 @@ To check the online/offline status of users, the GET request process changes sli
 - 1 billion users → 1 billion entries → 8 GB.
 - For 1 billion users, the storage requirement is only 8 GB, which is quite manageable.
 
-![plot](7.png)
+![plot](Pictures/7.png)
 
 ## Optimization Options: Storing Only Online Users (Framework of Opposite)
 
@@ -107,7 +107,7 @@ Although storage is not a significant concern, we can further optimize by storin
 - In this approach, instead of keeping data for all users, we only store data for users who are currently online.
 - This requires deleting entries of users who haven't sent a heartbeat within the last 10 seconds.
 
-![plot](9.png)
+![plot](Pictures/9.png)
 
 ### Handling Offline Status:
 When a user is marked as offline (no heartbeat received within 10 seconds), their data needs to be removed from the database. There are two ways to achieve this:
@@ -117,7 +117,7 @@ When a user is marked as offline (no heartbeat received within 10 seconds), thei
     - Use a database that supports automatic expiration of records after a certain time (e.g., Redis for in-memory open source storage or DynamoDB for a managed solution).
     - This ensures that data is automatically removed when the user's entry becomes outdated.
 
-![plot](10.png)
+![plot](Pictures/10.png)
 
 ## Updated GET and POST Requests for User Status for option 2
 
@@ -146,7 +146,7 @@ When a user is marked as offline (no heartbeat received within 10 seconds), thei
     - Supports data expiration with some configuration.
     - Managed by AWS, but has less community support compared to Redis.
 
-![plot](11.png)
+![plot](Pictures/11.png)
 
 **Vendor login:** Vendor lock-in is when a customer is unable to easily switch to a different product or service from a vendor without incurring significant costs.
 
