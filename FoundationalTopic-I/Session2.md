@@ -67,7 +67,7 @@ However, caching isn't just about storing data in RAM. It can happen at various 
 
 ### Cache Challenges
 
-![plot](18.png)
+![plot](Pictures/18.png)
 
 In this setup, when users request a post from the API server, the server first checks if the post is already stored in the cache:
 
