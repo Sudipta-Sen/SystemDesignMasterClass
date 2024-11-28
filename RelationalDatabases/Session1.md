@@ -1,4 +1,8 @@
-#  Pessimistic Locking and Airline Check-in System
+#  Database Locking and Airline Check-in System
+
+## Optimistic Locking vs Pessimistic Locking:
+
+Check this link:- https://medium.com/@abhirup.acharya009/managing-concurrent-access-optimistic-locking-vs-pessimistic-locking-0f6a64294db7 
 
 ## Pessimistic Locking in Relational Databases
 
@@ -78,19 +82,73 @@ Designing a system for passengers to reserve seats during check-in (not booking)
 - Each flight has 120 seats.
 - Multiple people may try to reserve seats on the same flight simultaneously.
 
-### Problem:
-If 120 users try to reserve a seat at the same time, without proper locking, multiple users could reserve the same seat. The last user’s transaction to commit would overwrite the previous ones, causing inconsistencies.
+### Problem: Concurrent Seat Reservation
+Imagine the situation where 120 users attempt to reserve seats on the same flight, at the same time. This can cause several issues with the seat reservation process, specifically in terms of data consistency. Here’s how the seat reservation process might break down:
+    ![plot](Pictures/14.png)
 
-### Solution:
-- Use `FOR UPDATE` in the SQL query to lock a seat when it’s being reserved.
-- This guarantees that only one transaction can reserve a specific seat at a time.
+- Flow of Reserving a Seat:
+    1. The system searches for the first available seat.
+    2. The system then books that seat for the user.
 
-### Flow:
-1. Users select a free seat.
-2. The system locks the seat for that user using exclusive locking (FOR UPDATE).
-3. After the seat is reserved and the transaction is committed, the lock is released.
-4. The other users' transactions will now reevaluate the query and find the next available seat.
+- The Issue:
+    - If we don’t apply proper synchronization mechanisms and simply select a free seat (like how we write simple SQL queries in examples or on platforms like Leetcode), we can encounter a race condition.
 
-### Optimizing with Skip Locked:
-- By adding SKIP LOCKED, users don’t have to wait for locks to be released. If a seat is locked, the system moves to the next available seat.
-- This increases throughput but doesn’t guarantee seats will be reserved in order. However, correctness is maintained as no two users can reserve the same seat.
+    - Multiple users may select the same seat at the same time, as no lock is placed on the seat record. When they attempt to commit their changes, the last user’s commit will overwrite the others, causing inconsistent results.
+
+        ![plot](Pictures/16.png)
+
+- For example:
+
+    - User 1 select Seat 1 as free seat, and then User 2 also selects Seat 1 as well as a free seat.
+    - When both users commit their transactions, only the last one to commit (for example, User 2) will actually reserve the seat.
+    - The system may end up with Seat 1 reserved by multiple users, and this causes inconsistency because multiple people will be shown the same seat, leading to confusion.
+
+### The Solution: Pessimistic Locking with `FOR UPDATE`
+To avoid the issue mentioned above, we need to ensure that only one transaction can update a seat at any given time.
+
+Here’s how we can solve this problem:
+
+1. Using `FOR UPDATE`:
+    - When a user tries to reserve a seat, we use the `FOR UPDATE` clause with the `SELECT` statement. This ensures that the row (seat) is locked for that user exclusively. Other transactions will have to wait until the lock is released.
+
+    - `How it works:` Once the lock is acquired by one transaction, other transactions attempting to book the same seat will be blocked. The lock is released only after the seat is successfully reserved and the transaction is committed by the user who reserved it.
+
+        ![plot](Pictures/11.png)
+
+2. Step-by-step Flow with `FOR UPDATE`:
+
+    - User 1 queries for a free seat and selects **Seat 1**.
+    - **Transaction 1** acquires an exclusive lock on **Seat 1** using `FOR UPDATE`.
+    - After **Transaction 1** successfully reserves **Seat 1** (committing the transaction), the lock is released.
+    - Now **Transaction 2** re-executes the query and acquires a lock on the next available seat (e.g., **Seat 2**). This process repeats until all users have been assigned a seat.
+
+3. Issue of Multiple Concurrent Requests:
+    - In the worst-case scenario, if all requests are evaluated at the same time, they may initially all select the same seat (e.g., **Seat 1**), but only **one transaction** can acquire the lock and all other transactions will wait for the lock to get released. 
+
+    - After the lock is released, each transaction will reevaluate(this is a feature of the DB, we don't need to give any other extra command) and select the next available seat, repeating the same process for all 120 seats.
+    
+    - The benefit of this approach is that each user gets a seat, and the system remains consistent without any conflict.
+
+### Optimization: `SKIP LOCKED`
+
+While the FOR UPDATE approach ensures correctness, it can sometimes lead to inefficiency because other transactions must wait for the lock to be released. This can cause unnecessary delays if a row is locked for an extended period.
+
+To optimize this, we can use `SKIP LOCKED`, which allows transactions to skip over locked rows and proceed with other available seats, rather than waiting for the lock to be released.
+
+- **How it works:** When a transaction encounters a locked row, it simply skips that seat and tries to lock another available seat.
+
+- **Benefit:** This approach increases throughput because transactions don’t have to wait for a lock to be released. While the order of seat reservations may not be guaranteed, correctness is still maintained because each transaction will still get a seat.
+
+    ![plot](Pictures/13.png)
+
+### When to Use `SKIP LOCKED` Approach
+This solution is effective when you have:
+
+- A fixed inventory (e.g., seats, tickets).
+- High contention for resources (e.g., many users trying to book the same seats).
+- A need for high throughput without sacrificing data consistency.
+
+Examples of Use Cases:
+- **IRCTC Ticket Booking:** When a large number of users are trying to book train tickets, this approach ensures that no two users book the same seat and every available seat gets filled.
+- **BookMyShow:** When many users are trying to book tickets for the same movie at the same time.
+- **Airline Check-in Systems:** To ensure that only one user can reserve a specific seat on a flight.
