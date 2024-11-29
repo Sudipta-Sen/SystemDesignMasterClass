@@ -127,7 +127,7 @@ Since the batch deletion approach leaves some expired keys in the database until
         - Return “Key Not Found” to the user. -- "May introduce lazy deletion here"
 ```
 
-Here we can think of **lazy deletion** i.e When a user requests a key (`GET`), the system checks the `expired_at` value. If the key has expired, it is deleted and “Key Not Found” is returned. However, this approach comes with its own drawbacks.
+Here we can think of **lazy deletion** i.e When a user requests a key (`GET`), the system checks the `expired_at` value. If the key has expired, it deletes the key and “Key Not Found” is returned. However, this approach comes with its own drawbacks.
 
 ### Problem with Lazy Deletion
 - Lazy deletion only deletes one row at a time, and in the worst-case scenario, each delete operation could trigger a `B+ tree rebalancing`. Frequent rebalancing can make each operation more time-consuming, significantly affecting performance.
@@ -219,6 +219,33 @@ We can optimize the **DEL(K)** operation to handle cases where the key is alread
 2. Efficient Deletion:
     - By creating an index on the `expired_at` field and assuming it is stored in RAM, we can avoid disk I/O for updates. By selectively updating only valid (non-expired) keys, we minimize disk operations, resulting in improved performance.
 
+## Summarising all the Operations 
+- PUT(K, V, TTLTime)
+    ```sql
+    UPSERT INTO store (key, value, expired_at)
+    VALUES ('K', 'V', NOW() + INTERVAL TTLTime MINUTE);
+    ```
+
+- GET(K)
+    ```sql
+    SELECT *
+    FROM store
+    WHERE key = K AND expired_at > NOW();
+    ```
+- DEL(K)
+    ```sql
+    UPDATE store 
+    SET expired_at = -1
+    WHERE key = 'K' AND expired_at > NOW();
+    ```
+- Cron Job / Batch Deletion
+    ```sql
+    DELETE FROM store
+    WHERE expired_at < NOW()
+    LIMIT 1000;
+    ```
+
+Users will only interact with the **PUT**, **GET**, and **DEL** APIs, while the underlying SQL queries will be executed internally. The actual SQL operations are abstracted from the user, ensuring they do not need to know the structure or workings of our key-value store database.
 
 ## Storage-Compute Separation:
 In modern databases, the storage and compute layers are often separated for scalability. In this design:
