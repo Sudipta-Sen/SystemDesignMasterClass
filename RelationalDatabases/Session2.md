@@ -255,23 +255,61 @@ In modern databases, the storage and compute layers are often separated for scal
 
 By separating the two, the system can scale the compute nodes (key-value API servers) independently of the storage nodes, allowing for horizontal scalability.
 
-## Scaling Read and Write Operations:
+### Problem in Traditional Systems:
+In traditional systems, the compute and storage layers are tightly coupled. For example, if we're using MySQL as our storage, it stores the data and performs compute operations like querying and filtering. However, in distributed systems, this tight coupling limits scalability, as the compute layer often needs to talk to multiple storage nodes to retrieve, join, or filter data before returning it to the user. This coupling creates a bottleneck when scaling.
 
-1. Scaling Reads:
+### Solution: Separating Compute and Storage
 
-    - If the system has more reads than writes, read replicas can be added to offload read requests from the master node.
+Many modern databases solve this problem by separating the compute and storage layers, allowing them to scale independently. In our example:
+- The **storage layer** (e.g., MySQL, NoSQL, or even a JSON file on disk) simply stores and serves the requested data by allowing some basic querying.
 
-    - To handle potential replication lag, users can specify whether they require consistent reads (from the master) or eventually consistent reads (from the replica).
+- The **compute layer** (KV-API servers) sends queries to storage nodes, collects the data, processes it (e.g., filtering, joining), and then returns the result to the user.
 
-2. Scaling Writes:
-    - Write operations are more challenging to scale. Once the system reaches its limit, sharding (dividing the database into smaller chunks) is necessary.
+This separation enables horizontal scaling of the compute nodes while keeping the underlying storage the same. We can add as many KV-API servers as necessary to handle the load, assuming our storage layer can keep up. Auto-scaling policies can dynamically adjust the number of KV-API servers based on demand.
 
-    - Sharding strategies can include range-based partitioning (e.g., partitioning based on alphabetical order) or hash-based partitioning (using a hash function to distribute keys across shards).
+### Scaling the Storage Node
+As the number of KV-API servers increases, the load on the storage node (MySQL) may become overwhelming. In such cases, we can scale the storage layer as well.
 
-## Sharding and Topology:
+#### Scaling Reads:
 
-When the database is sharded, each master node is responsible for a specific range of data. To manage data distribution:
+- **Read Replicas:** For systems where reads are more frequent than writes, we can add read replica nodes to offload the read requests from the master storage node.
 
-- A zookeeper (or similar service) is used to track the topology of the database and assign queries to the correct shard.
+- **Problem:** This introduces replication lag, meaning data changes in the master node may not yet reflect in the replicas. Users may get stale data if they read from a replica before it is updated.
 
-- The KV-API server queries the zookeeper to find the correct shard for each request.
+- **Solution:** We can use two types of connection pools in the KV-API servers:
+    - A pool for reading from the master node for consistent (up-to-date) data.
+    - A pool for reading from replica nodes for faster, less critical reads (potentially stale data)
+
+- **User Options:**
+    - Users can choose between **consistent reads** (from the master) by passing `consistent=True` in the GET request, or **inconsistent reads** (from replicas) without this parameter.
+    - **Trade-off:** Consistent reads are more expensive in terms of latency and cost but ensure up-to-date data. Inconsistent reads are cheaper but may return stale data. This is similar to how **DynamoDB** operates.
+
+#### Scaling Writes:
+
+Scaling writes is more complex. Simply scaling the master node will not suffice after a certain point. We need to scale writes by **sharding** the database:
+
+- **Sharding:** Dividing the data across multiple master nodes based on ownership i.e each master node is responsible for a specific range of data
+    1. **Range-based sharding:** Split data based on ranges of values (e.g., keys `a-m` go to master1, and keys `n-z` go to master2).
+    2. **Hash-based partitioning:** Use a hash function to distribute keys across multiple masters (e.g., if the hash value is `0`, data goes to master1; if `1`, it goes to master2).
+    
+    There are many more sharding algorithms available.
+
+##### KV-API and Data Ownership
+For each **GET** or **PUT** request, the KV-API must know which master node owns the data. This requires the KV-API to understand the database topology. KV-API can itself hold all the information of DB topology or offload that task to someone else.
+
+- Proxy or Zookeeper
+    - We can add a **proxy** between the KV-API and storage nodes to handle routing based on data ownership. The proxy knows which master node owns which data and directs API requests accordingly.
+    
+    - Alternatively, we can use **Zookeeper**, a distributed coordination service, to manage the database topology. Zookeeper holds the configuration for all the KV-API servers and ensures they are in sync with the latest database structure. Each KV-API server keeps a copy of the Zookeeper configuration, allowing it to query the correct master node. We will read Zookeeper in dept in later weeks.
+
+##### How a Request is Handled:
+1. KV-API receives a request.
+
+2. It consults the Zookeeper configuration to determine which master node owns the data and retrives the master node's address.
+
+3. The KV-API performs the GET or PUT operation with the respective master node.
+
+4. Each master node has its own read replicas, so for a **GET** request the KV-API can also decide whether to read from the master or one of its replicas based on the request.
+
+### Conclusion: The Power of Storage-Compute Separation
+This architecture, with separated compute and storage layers, allows us to scale both independently. The KV-API servers handle the compute tasks, while the storage nodes handle data persistence. Zookeeper or a proxy ensures data is routed to the correct master or replica node, based on data ownership.
