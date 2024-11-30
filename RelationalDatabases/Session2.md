@@ -19,6 +19,8 @@ The key challenges addressed in this design include efficient handling of expire
 - **Scalability:** The system should be horizontally scalable.
 - **Storage Engine:** The underlying storage engine is an SQL-based RDBMS.
 
+![plot](Pictures/18.png)
+
 ## Data Schema:
 Initially, a basic schema for the key-value store could look like this:
 
@@ -178,6 +180,8 @@ The `PUT` operation involves either updating the value of an existing key or ins
     - Additionally, each operation must be wrapped inside a transaction, adding 4ms for starting and ending the transaction.
     - So the total `PUT` query execution time becomes 8ms, which is huge.
 
+    ![plot](Pictures/22.png)
+
 ###  Optimized Solution: Using UPSERT (REPLACE in MySQL, UPSERT in PostgreSQL)
 Instead of performing multiple steps, we can use an UPSERT statement, which combines the logic of updating the key if it exists and inserting a new key if it doesn't:
 - **DB Query:**
@@ -186,12 +190,16 @@ Instead of performing multiple steps, we can use an UPSERT statement, which comb
     VALUES ('K', 'V', NOW() + INTERVAL 30 MINUTE);
     ```
 
+    ![plot](Pictures/27.png)
+
 ### How This Solves the Problem:
 1. Reduced Network Round-Trips:
     - Only one round-trip to the database is needed, reducing the total time from 4ms to 2ms.
 
 2. No Explicit Transaction Management:
     - The database automatically wraps the single UPSERT command inside a transaction, eliminating the need for the API server to manage transaction start and end signals.
+
+    ![plot](Pictures/25.png)
 
 ## GET Operation
 For the GET(K) operation, we want to retrieve the value only if the key exists and has not expired:
@@ -265,12 +273,14 @@ Many modern databases solve this problem by separating the compute and storage l
 
 - The **compute layer** (KV-API servers) sends queries to storage nodes, collects the data, processes it (e.g., filtering, joining), and then returns the result to the user.
 
+![plot](Pictures/28.png)
+
 This separation enables horizontal scaling of the compute nodes while keeping the underlying storage the same. We can add as many KV-API servers as necessary to handle the load, assuming our storage layer can keep up. Auto-scaling policies can dynamically adjust the number of KV-API servers based on demand.
 
 ### Scaling the Storage Node
 As the number of KV-API servers increases, the load on the storage node (MySQL) may become overwhelming. In such cases, we can scale the storage layer as well.
 
-#### Scaling Reads:
+#### 1. Scaling Reads:
 
 - **Read Replicas:** For systems where reads are more frequent than writes, we can add read replica nodes to offload the read requests from the master storage node.
 
@@ -280,11 +290,13 @@ As the number of KV-API servers increases, the load on the storage node (MySQL) 
     - A pool for reading from the master node for consistent (up-to-date) data.
     - A pool for reading from replica nodes for faster, less critical reads (potentially stale data)
 
+        ![plot](Pictures/29.png)
+
 - **User Options:**
     - Users can choose between **consistent reads** (from the master) by passing `consistent=True` in the GET request, or **inconsistent reads** (from replicas) without this parameter.
     - **Trade-off:** Consistent reads are more expensive in terms of latency and cost but ensure up-to-date data. Inconsistent reads are cheaper but may return stale data. This is similar to how **DynamoDB** operates.
 
-#### Scaling Writes:
+#### 2. Scaling Writes:
 
 Scaling writes is more complex. Simply scaling the master node will not suffice after a certain point. We need to scale writes by **sharding** the database:
 
