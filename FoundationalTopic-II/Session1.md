@@ -55,7 +55,7 @@ These issues are all solvable, but they require careful consideration and planni
 
 ### Two Types of Scaling:
 1. Vertical Scaling:
-    - Increase CPU, RAM, or disk space on existing servers.
+    - Increase CPU, RAM, or disk space on existing servers. RAfter upgrading the resources, simply reboot the system to apply the changes
     - Pros: Simple implementation.
     - Cons: Limited by hardware capacity.
 
@@ -89,6 +89,6 @@ These issues are all solvable, but they require careful consideration and planni
 1. Connection Pools:
     - API servers maintain two types of connection pools: one for read replicas and another for the master node. Depending on the query type (read/write), the appropriate pool is used.
 2. Database Proxy (RDS Proxy, ProxySQL):
-    - If the database topology is elastic (i.e., dynamic scaling), API servers may not be aware of which nodes to connect to. In this case, a proxy server (like ProxySQL) manages all database connections and routes requests based on predefined rules.
+    - If the database topology is elastic (i.e., dynamic scaling), API servers may not be aware of which nodes to connect to. In this case, a proxy server (like ProxySQL) manages all database connections and routes requests based on predefined rules. We can scale this proxy Horizontally, read about it.
 
     ![plot](Pictures/3.png)
