@@ -58,6 +58,8 @@ The system can now query the same for both group and direct messages by using ju
 
 - **Membership Table** (formerly `Users_Channels`): This table now handles both DM and group memberships. Add additional fields for `is_star`, `is_favorite`, `mute`, `preference` for each user’s relationship to the channel.
 
+![](Pictures/6.png)
+
 ## Message Processing
 
 Now, let's discuss the messaging part:
@@ -80,6 +82,8 @@ Messages are cached as they are immutable, improving efficiency.
 
 
 When scrolling through historical messages, there is no need for data to be transmitted via websockets. Websockets are specifically designed for real-time message delivery to the frontend, ensuring immediate updates for active conversations. Historical messages can be fetched through other methods like REST APIs or pagination, reducing resource consumption from websockets.
+
+![](Pictures/7.png)
 
 ### Write Path (Message Persistence)
 All users connect via web sockets to an edge server, which handles sending and receiving messages in real-time. When a user sends a message, it is first routed to the edge server, and the server is responsible for storing this data in the database. There are two main methods to persist this data:
@@ -107,7 +111,9 @@ All users connect via web sockets to an edge server, which handles sending and r
 
 In our scenario, when User A sends a message, it’s persisted via a POST request to a REST API. To deliver the message to User B in real-time, both users are connected to an edge server via WebSocket. After persistence, the API server notifies the edge server, which then pushes the message to User B.
 
-## Scaling WebSocket Servers
+![](Pictures/8.png)
+
+## Vertical Scaling WebSocket/Edge Servers
 
 The DB is horizontally partitioned, and the API servers are stateless, allowing them to scale horizontally by placing them behind a load balancer. However, scaling the edge (socket) server is more challenging due to their stateful nature:
 
@@ -119,7 +125,7 @@ If the `src_ip` is fixed (i.e., for a single source system), the server can use 
 
 As mentioned in a blog post, WhatsApp's edge servers, which are exposed to the internet (Naked Edge Servers), are designed to support up to 5 million TCP connections on a single server. However, this raises concerns about security, as exposing servers directly to the public internet can compromise sensitive information. To mitigate this, WhatsApp uses a **Dual NIC** setup, where one network card is public-facing and the other is private-facing. This configuration ensures that while the server is accessible on the internet, no sensitive information resides on it, as the communication between the public and private networks is securely relayed through the two network cards.
 
-## Horizontal Scalability of Edge Servers
+## Horizontal Scalability of WebSocket/Edge Servers
 
 In this design, we focus on scaling the edge servers horizontally to handle multiple users while optimizing real-time communication across channels.
 
@@ -145,6 +151,8 @@ Each edge server is connected to every other edge server. When A sends a message
 
 **Optimization:** In the case where a message is sent in a channel with fewer users, such as CH2 (with only A and E), the message is still sent to all edge servers, creating unnecessary network traffic. To optimize, we can adopt an alternative approach.
 
+![](Pictures/9.png)
+
 ### Optimized Approach
 
 #### Approach1: Managing Edge Server Subscriptions
@@ -160,6 +168,8 @@ When an edge server, such as **ED1**, receives a message, it will refer to this 
 #### Approach2: STAR Topology with Redis Pub-Sub
 
 Instead of maintaining seprate table and every edge server communicating with every other edge server, a **STAR topology** can be implemented. In this approach, all edge servers are connected to a central entity. This approach simplifies the management of subscriptions and makes it easier to add or remove edge servers. The central entity can store the edge server-to-channel mapping and handle the forwarding of messages.
+
+![](Pictures/10.png)
 
 Process Flow:
 
@@ -196,6 +206,7 @@ When users connect to the system, they need to connect to an edge server. How th
 
     **Resilience:** If an edge server goes down, the connection balancer assigns the user a new edge server to connect to. The balancer aims to pack users from the same organization as closely as possible to minimize latency and cross-server overhead.
 
+
 ## Key Takeaways:
 1. **Star Topology:** Minimizes connections between edge servers and improves scalability by using a central Redis Pub-Sub server.
 
@@ -208,3 +219,5 @@ When users connect to the system, they need to connect to an edge server. How th
 5. **Handling Edge Server Failures:** If an edge server fails, users reconnect via the connection balancer, ensuring continuous communication.
 
 By using Redis Pub-Sub, a connection balancer, and efficient topologies, we can scale edge servers horizontally while maintaining efficient and real-time communication across channels.
+
+![](Pictures/11.png)
