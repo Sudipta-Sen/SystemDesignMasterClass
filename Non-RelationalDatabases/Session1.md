@@ -41,6 +41,8 @@
     - DynamoDB
     - Aerospike
 
+    ![](Pictures/1.png)
+
 ## Column-Oriented Databases
 - **Definition:** 
 
@@ -52,11 +54,15 @@
 
     All columns of a row are stored together in a single disk block. This design minimizes the number of I/O operations needed to access or modify the entire row, making it ideal for transaction-based queries(OLTP) where you typically need to retrieve or update most columns in a row. (e.g., `SELECT * FROM table`)
 
+    ![](Pictures/2.png)
+
 - **Column-Oriented for OLAP:**
 
     In contrast, column-oriented databases are designed for scenarios where you only need to read a subset of columns (e.g., CPU usage, timestamps).
 
     Column-oriented DBs store the values of each column in separate disk blocks. This approach optimizes performance when querying specific columns across multiple rows, as it minimizes the number of I/O operations required to retrieve all values for a specific column (e.g., `SELECT cpu_usage, timestamp FROM table`). This makes column-oriented DBs more efficient for analytical queries (OLAP) such as data mining and reporting that focus on few columns rather than entire rows.
+
+    ![](Pictures/3.png)
 
 - **Example:** 
     - Apache HBase
@@ -74,6 +80,8 @@
 - **Advantages:** 
 
     By packing the same column families together and store it in the same disk block, wide-column databases reduce the number of disk reads and optimize data retrieval. This structure is particularly useful when different queries target different sets of columns within the same dataset. So while reading the `stats` column family, this arrangement minimizes disk reads by storing all related data in the same disk block until the disk block is filled.
+
+    ![](Pictures/4.png)
 
 - **Example:**
     - Apache Cassandra
@@ -113,6 +121,9 @@
 - **Built for Sharding:**
 
     NoSQL databases are designed for horizontal scalability through sharding. For example, when we create a DynamoDB table, it requires us to define a partition key (also called a hash key) and an optional range key to automatically shard data across multiple nodes, enabling better distribution and management of large datasets.
+
+
+![](Pictures/5.png)
 
 ## When to Use SQL:
 - **ACID Properties:** It helps to maintain strict transactional consistency.
