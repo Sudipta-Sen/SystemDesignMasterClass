@@ -93,3 +93,54 @@ To optimize, we **cache the configuration in the LB server**, avoiding repeated 
     - Zookeeper provides a durable, fault-tolerant, distributed config store with built-in pub-sub capabilities.
 
     - It tracks servers listening to a particular configuration key, ensuring guaranteed delivery when config changes.
+
+## Observability for LB Server
+In a distributed system, monitoring backend servers is essential to maintain availability and performance. As we focus on LB servers in this discussion, we’ll explore how observability helps monitor LB performance, track backend health, and manage system scaling to ensure optimal reliability.
+
+### Health Check and LB Monitoring
+
+- LB forwards client requests to backend servers. To ensure efficient routing, it's important for the LB to know the current health of each backend server.
+
+- **Health Check API:** Each backend server exposes a `/health` endpoint, which the LB could theoretically use to monitor server health.
+
+- **Challenges:** Performing health checks directly from the LB is inefficient. Large numbers of backend servers would slow down the LB’s primary task of routing requests.
+
+    - Technical Reasons:
+        - Limited TCP connections: Each health check and request require separate connections.
+        
+        - Redundant health checks from multiple LBs: Multiple LBs querying the same server create unnecessary load.
+        
+        - **Staleness and delay:** If backend servers fail between health checks, this might not be reflected immediately in the LB’s decision-making process.
+
+
+### Orchestrator for Health Checks
+- Instead of having the LB handle health checks, we introduce an **Orchestrator Server**. This server regularly checks the health of all backend servers and updates the central **Config DB** accordingly.
+
+- Advantages:
+    - Reduces the load on LBs.
+    - Removes redundant checks by delegating to a single orchestrator that updates all LBs.
+    - Allows efficient updating of backend server health in a highly available manner.
+
+### Self-Healing and Scalability
+- The orchestrator system is designed to be self-healing. If an orchestrator worker goes down, another worker takes over its responsibilities. A leader is elected to distribute the monitoring tasks among workers.
+
+- Leader Election: The orchestrator system includes a leader who delegates backend server monitoring to workers. If a leader fails, another worker can take over as the leader, ensuring continuous monitoring.
+
+###  Redis Pub-Sub Model for Configuration Updates
+- A Redis Pub-Sub model is used to update LBs when there are configuration changes in the Config DB (e.g., adding or removing a backend server).
+    - New LB servers subscribe to the Redis Pub-Sub channel, and whenever there’s a change in the Config DB, the update is pushed to all subscribed LBs.
+    - This eliminates the need to manually track IP addresses of all LB servers.
+
+### Ensuring Availability with Prometheus and DNS
+- **Monitoring with Prometheus:** The orchestrator uses Prometheus to monitor average CPU and memory utilization and to determine when to scale the number of LB servers up or down.
+
+- **DNS for Load Balancing:** Instead of introducing another LB for the LBs, a DNS server is used to distribute traffic among multiple LBs.
+
+    - When a user requests a domain (e.g., `google.com`), the DNS server returns the IP address of an available LB.
+    
+    - The orchestrator ensures that new LBs are added to the DNS, and old LBs are removed automatically as part of scaling.
+
+### Core DNS with Virtual IP for High Availability
+- To ensure high availability of the DNS server itself, multiple Core DNS servers are set up with a Virtual IP (VIP). This VIP is mapped to the actual DNS server's physical IP address at the router level.
+
+- The virtual IP ensures that even if the physical DNS server IP changes due to failover, the external world continues to interact with the system through a stable IP address.
