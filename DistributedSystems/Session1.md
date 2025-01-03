@@ -8,24 +8,30 @@ In designing distributed systems, ensuring high availability is crucial. One com
 
 A load balancer forwards requests from users to backend servers and can be configured with **load balancer algorithms**, **health protocols**, and **IP addresses of backend servers**. Typically, the configuration of multiple LB servers is stored centrally in a **Configuration Database (Config DB)**.
 
+![](Pictures/1.png)
+
 ### The Importance of Centralized Config DB in LB
 
-We could consider storing the configuration directly within the Load Balancer (LB) itself, eliminating the need for a separate database. However, it’s important to think about **who** interacts with the LB. The primary users may seem to be the clients accessing backend servers, but they are not the only users. For instance, consider how AWS manages its load balancers—AWS developers configure the LB through internal tools like AWS Console, which communicates with the LB through APIs. This shows that the LB must serve both end users and the developers who manage it.
+We could consider storing the configuration directly within the LB itself, eliminating the need for a separate database. However, it’s important to think about **who** interacts with the LB. The primary users may seem to be the clients accessing backend servers, but they are not the only users. For instance, consider how AWS manages its load balancers—AWS developers configure the LB through internal tools like AWS Console, which communicates with the LB through APIs. This shows that the LB must serve both end users and the developers who manage it.
 
 Therefore, we need a **central source of truth** for configuration data that can easily accommodate adding or removing LB servers and managing their settings. Storing configurations in the LB itself reduces flexibility and makes it difficult to handle dynamic scaling or changes.
+
+![](Pictures/2.png)
 
 **System design is not just about coding or engineering solutions**; it’s about understanding the needs of the users and designing a system that caters to those needs. Empathy toward how your users—whether developers or end users—interact with the system ensures that the design is practical and production-ready. This holistic approach leads to more reliable, maintainable systems.
 
 ### Basic Flow for LB Operation
 Till now we can think of the request flow as -- 
 
-1. **Client Request:** Users send their requests to the Load Balancer (LB) server.
+1. **Client Request:** Users send their requests to the LB server.
 
 2. **Configuration Fetch:** The LB server retrieves necessary information, such as backend server details, from the configuration database.
 
 3. **Backend Selection:** Based on the configuration, the LB server selects a suitable backend server to handle the request.
 
 4. **Response Handling:** The LB server forwards the client's request to the chosen backend server, retrieves the response, and then sends it back to the user.
+
+    ![](Pictures/3.png)
 
 ### Issues with the Current Request Flow Architecture with LB
 
@@ -75,7 +81,9 @@ To optimize, we **cache the configuration in the LB server**, avoiding repeated 
 
     - Whenever a new LB server is added, it automatically subscribes to the Pub-Sub model. This ensures that when the configuration in the config DB is updated, the LB API pushes the changes to the Pub-Sub system. The Pub-Sub model then broadcasts those updates to all subscribed LB servers, eliminating the need to manually track or manage the IP addresses of individual LB servers.
 
-    - **Limitations:** Redis cannot ensure guaranteed delivery, so missed updates are possible.
+        ![](Pictures/4.png)
+
+    - **Limitations:** Redis doesn't track whether the update was successfully received by the LB server. This failure could be due to network issues or internal problems within the LB server. Redis simply **pushes updates but doesn’t ensure guaranteed delivery**, which means an LB server could operate with outdated configurations if it misses an update.
 
 5. **Hybrid Approach: Redis Pub-Sub + Polling**
 
@@ -120,6 +128,8 @@ In a distributed system, monitoring backend servers is essential to maintain ava
 ### Orchestrator for Health Checks
 - Instead of having the LB handle health checks, we introduce an **Orchestrator Server**. This server regularly checks the health of all backend servers and updates the central **Config DB** which is also used by LB server.
 
+    ![](Pictures/5.png)
+
 - Advantages:
     - Reduces the load on LBs.
     - Removes redundant checks by delegating to a single orchestrator that updates all LBs.
@@ -131,7 +141,7 @@ In a distributed system, monitoring backend servers is essential to maintain ava
 
     While we could consider having Bservers push health updates directly to the LB server, this approach is not feasible as it requires Bservers to be aware of the LB server’s IP addresses, which should ideally remain abstracted.
 
-- **Solution:** Instead of relying on a single orchestrator, the system can have multiple orchestrators. There are two typer of orchestrator nodes - 
+- **Solution:** Instead of relying on a single orchestrator, the system can have multiple orchestrators. There are two type of orchestrator nodes - 
     1. Leader
     2. Worker
 
@@ -188,6 +198,8 @@ To ensure high availability for Core DNS, we can deploy multiple Core DNS server
     - The solution is to use a **Virtual IP (VIP)**. The VIP can be configured at the router level, where it is mapped to the physical IP address of the Core DNS. Externally, the VIP is broadcasted, and inside the network, it is mapped to a physical Core DNS IP. When the physical Core DNS IP changes (for example, during a failover to the passive server), the mapping changes, but the VIP remains constant.
 
         This ensures that users continue to query the same VIP, which abstracts the internal changes in the physical IPs of the DNS servers. This is why cloud platforms often provide a domain name for Core DNS that points to a virtual IP rather than a physical one, allowing for seamless failover without requiring users to track IP changes.
+
+    ![](Pictures/6.png)
 
 ---------------------------
 
