@@ -106,25 +106,54 @@ In a distributed system, monitoring backend servers is essential to maintain ava
 - **Challenges:** Performing health checks directly from the LB is inefficient. Large numbers of backend servers would slow down the LB’s primary task of routing requests.
 
     - Technical Reasons:
-        - Limited TCP connections: Each health check and request require separate connections.
+        - **Limited TCP connections:** The number of TCP connections a server can handle is limited. For each backend server, two TCP connections are required: 
         
-        - Redundant health checks from multiple LBs: Multiple LBs querying the same server create unnecessary load.
+            - one for relaying messages
+            - another for health checks. 
         
-        - **Staleness and delay:** If backend servers fail between health checks, this might not be reflected immediately in the LB’s decision-making process.
+            This unnecessarily burdens the LB server. It should focus on routing requests efficiently rather than performing additional tasks like health monitoring.
 
+        - **Redundant health checks from multiple LBs:** If multiple LB servers are performing health checks on the same backend server (Bservers), it leads to redundant work and unnecessary traffic. This increases the load on Bservers due to frequent health check requests. 
+        
+            Additionally, it exposes a leaky abstraction: for example, if a LB server is scheduled to perform one health check every 5 secs but if a Bserver receives 5 health check requests every 5 secs, it can infer that there are 5 LB servers, which should ideally remain abstracted. The backend should not be aware of the number of LB servers in the system.
 
 ### Orchestrator for Health Checks
-- Instead of having the LB handle health checks, we introduce an **Orchestrator Server**. This server regularly checks the health of all backend servers and updates the central **Config DB** accordingly.
+- Instead of having the LB handle health checks, we introduce an **Orchestrator Server**. This server regularly checks the health of all backend servers and updates the central **Config DB** which is also used by LB server.
 
 - Advantages:
     - Reduces the load on LBs.
     - Removes redundant checks by delegating to a single orchestrator that updates all LBs.
-    - Allows efficient updating of backend server health in a highly available manner.
+    - Allows efficient updating of Bserver health in a highly available manner.
 
-### Self-Healing and Scalability
-- The orchestrator system is designed to be self-healing. If an orchestrator worker goes down, another worker takes over its responsibilities. A leader is elected to distribute the monitoring tasks among workers.
+#### Self-Healing and Scalability
 
-- Leader Election: The orchestrator system includes a leader who delegates backend server monitoring to workers. If a leader fails, another worker can take over as the leader, ensuring continuous monitoring.
+- **Potential Issue:** If the orchestrator server goes down, we would need another monitor to check its status, leading to a potential chain of monitoring the monitor itself. 
+
+    While we could consider having Bservers push health updates directly to the LB server, this approach is not feasible as it requires Bservers to be aware of the LB server’s IP addresses, which should ideally remain abstracted.
+
+- **Solution:** Instead of relying on a single orchestrator, the system can have multiple orchestrators. There are two typer of orchestrator nodes - 
+    1. Leader
+    2. Worker
+
+    Orchestrator workers work under the leader node. In the event of leader failure, these workers do not stop functioning. The system elects a new leader from the pool of workers. This way, we avoid needing continuous monitors for the monitors and ensure that the system is self-healing.
+
+- **Leader Election:** The orchestrator system implements leader election to maintain high availability and self-healing capabilities. 
+
+    If a worker becomes overloaded -- 
+    - other workers can step in to assist. 
+    - If none are available, the leader can dynamically spawn new workers and delegate tasks to them. 
+    
+    In case the leader goes down, another server within the worker pool will automatically take over leadership duties. Two popular leader election algorithms are -- 
+    - LCR Algorithm with time complexity O(n²) 
+    - HS Algorithm with time complexity O(nlogn)
+
+### Handling Bserver Downtime Without Overburdening the LB Server
+
+A common consideration arises: what if the orchestrator takes a few milliseconds (e.g., 5ms) to detect that a Bserver is down, and in that short window, the LB server still forwards a request to the downed Bserver? It seems logical to think that the LB could identify a failed Bserver if it receives consecutive 5XX errors. However, this method is flawed because not all 5XX errors are indicative of a Bserver failure. For example, a user may make a bad request, leading to 5XX responses even when the Bserver is functioning properly.
+
+Relying on the LB to continuously call the Bserver's health API is also not a viable solution, as this brings us back to the initial problem: overloading the LB with responsibilities beyond request routing.
+
+The LB and orchestrator should have distinct responsibilities. The LB should not be burdened with the task of detecting Bserver failures. Instead, health checks and failure detection must remain the orchestrator's duty, while the LB focuses on relaying requests to backend servers. Keeping these responsibilities separate ensures more efficient operations and avoids unnecessary interference between the two components.
 
 ###  Redis Pub-Sub Model for Configuration Updates
 - A Redis Pub-Sub model is used to update LBs when there are configuration changes in the Config DB (e.g., adding or removing a backend server).
@@ -132,15 +161,38 @@ In a distributed system, monitoring backend servers is essential to maintain ava
     - This eliminates the need to manually track IP addresses of all LB servers.
 
 ### Ensuring Availability with Prometheus and DNS
-- **Monitoring with Prometheus:** The orchestrator uses Prometheus to monitor average CPU and memory utilization and to determine when to scale the number of LB servers up or down.
+- **Monitoring with Prometheus:** The orchestrator uses Prometheus to monitor average CPU and memory utilization and other necessary details to determine when to scale the number of LB servers up or down. Now, the orchestrator has two responsibilities.
+    - First, it monitors the health check APIs of the Bservers to ensure that only healthy servers are handling traffic. 
+    
+    - Second, it continuously monitors Prometheus metrics to auto-scale the LB servers based on resource utilization.
 
-- **DNS for Load Balancing:** Instead of introducing another LB for the LBs, a DNS server is used to distribute traffic among multiple LBs.
+- **DNS for Load Balancing of LB Servers:** When multiple LB servers are involved, traffic distribution among them becomes essential. It is not making sense of keeping another load balancer for the LB servers themselves. Instead of this task is handled by a DNS server. 
+
+    The DNS server distributes traffic across multiple LB servers by resolving the domain name to different IP addresses based on predefined algorithms, ensuring efficient load distribution
 
     - When a user requests a domain (e.g., `google.com`), the DNS server returns the IP address of an available LB.
     
-    - The orchestrator ensures that new LBs are added to the DNS, and old LBs are removed automatically as part of scaling.
+    - **Issue:** when a new LB server is added or an existing one is removed, who will update the core DNS? 
+    
+        **Solution:** The orchestrator ensures that new LBs are added to the DNS, and old LBs are removed automatically as part of scaling using DNS server api's.
 
 ### Core DNS with Virtual IP for High Availability
-- To ensure high availability of the DNS server itself, multiple Core DNS servers are set up with a Virtual IP (VIP). This VIP is mapped to the actual DNS server's physical IP address at the router level.
 
-- The virtual IP ensures that even if the physical DNS server IP changes due to failover, the external world continues to interact with the system through a stable IP address.
+To ensure high availability for Core DNS, we can deploy multiple Core DNS servers. However, the challenge arises in distributing traffic among these servers while maintaining high availability. One approach is to use like an orchestrator with leader election and an active-passive architecture.
+
+- Problem:
+
+    - When the active DNS server goes down and the passive server takes over, the IP address changes. This poses an issue when users are querying the Core DNS for domain name resolution — they need a way to track the changing IP addresses.
+
+- Solution:
+    - The solution is to use a **Virtual IP (VIP)**. The VIP can be configured at the router level, where it is mapped to the physical IP address of the Core DNS. Externally, the VIP is broadcasted, and inside the network, it is mapped to a physical Core DNS IP. When the physical Core DNS IP changes (for example, during a failover to the passive server), the mapping changes, but the VIP remains constant.
+
+        This ensures that users continue to query the same VIP, which abstracts the internal changes in the physical IPs of the DNS servers. This is why cloud platforms often provide a domain name for Core DNS that points to a virtual IP rather than a physical one, allowing for seamless failover without requiring users to track IP changes.
+
+---------------------------
+
+> Disclaimer:
+
+> This lecture by Arpit demonstrates coding your own load balancer. Replicate the code on your own.
+
+---------------------------
