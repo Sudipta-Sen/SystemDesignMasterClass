@@ -185,6 +185,8 @@ The LB and orchestrator should have distinct responsibilities. The LB should not
     - **Issue:** when a new LB server is added or an existing one is removed, who will update the core DNS? 
     
         **Solution:** The orchestrator ensures that new LBs are added to the DNS, and old LBs are removed automatically as part of scaling using DNS server api's.
+    
+    ![](Pictures/15.png)
 
 ### Core DNS with Virtual IP for High Availability
 
