@@ -66,6 +66,8 @@ Can you figure out any issue with the above release lock implementation?
 
 **Solution:** To prevent this race condition, atomicity between `redis.get` and `redis.delete` is required. Redis provides a solution using LUA scripts to ensure that both operations occur atomically, meaning they execute as a single unit. The command `eval` can be used to pass the `LUA script`, ensuring the lock is only deleted by the transaction that holds it. This guarantees that the lock management remains consistent even during context switches.
 
+![](Pictures/17.png)
+
 ![](Pictures/11.png)
 
 ---------------------------
@@ -77,15 +79,70 @@ Can you figure out any issue with the above release lock implementation?
 
 
 ## Distributed Lock for High Availability and Fault Tolerance
-For systems requiring fault tolerance and high availability, a single Redis node becomes a single point of failure. The solution is to implement a **distributed lock** using multiple independent Redis nodes. A lock is only considered acquired if it's successfully locked on more than 50% of the Redis nodes. This ensures:
 
-- Fault tolerance: Even if one or two nodes fail, locks can still be acquired.
-- No single point of failure.
+When using a single Redis server for remote locks, it introduces a single point of failure. To improve the system's fault tolerance and availability, a distributed lock approach is often used. Here’s how it works:
 
-For example, in a system with 5 Redis nodes, a transaction must acquire locks on at least 3 nodes to proceed. If 1 or 2 nodes go down, locks can still be acquired.
+1. **Multiple Redis Servers:**
+
+    - Instead of a single lock manager, we use `n independent` Redis servers.
+    - These Redis servers are not replicated, meaning each server operates independently.
+
+2. **Locking Mechanism:**
+
+    - A transaction acquires a lock if it can secure the lock on **more than 50% of the servers.**
+
+    - If a transaction fails to secure the majority of the locks, it releases all the acquired locks and reports failure, preventing deadlocks or starvation.
+
+        ![](Pictures/12.png)
+
+3. **Fault Tolerance:**
+
+    When using distributed locks across multiple Redis servers, the system ensures fault tolerance by requiring a transaction to acquire a lock on more than 50% of the total Redis servers. For example:
+
+    - In a system with **5 Redis servers**, a transaction must secure a lock on **at least 3 servers**.
+
+    - If **1 or 2 servers go down**, the transaction can still proceed by acquiring locks on the remaining servers, maintaining the ability to operate.
+
+    - However, even if one server goes down, the calculation of 50% is still based on the total number of Redis servers, not the active number. In the case of **5 servers**, even with **1 or 2 servers down**, the system still calculates the 50% threshold on the original total of 5 servers, meaning **3 locks** are always required.
+
+    - **If 3 servers go down**, the system cannot meet the majority requirement, and lock acquisition fails.
+
+    This fault tolerance provides resilience, with the ability to withstand failures of up to 2 servers while continuing to function normally. If higher fault tolerance is required, the number of Redis servers can be increased. The algorithm for the same -- 
+
+    ![](Pictures/13.png)
+
+4. **No State Maintenance for Redis Servers:**
+In this distributed lock system, Redis servers do not maintain state or replication. Even if a Redis server goes down while a transaction holds a lock, no conflict arises:
+
+    - For instance, if T1 acquires the lock on 3 servers and then one of the servers fails, the transaction continues its operation in the critical section with the remaining 2 locks.
+
+    - Other transactions cannot proceed until T1 releases all its locks, ensuring consistency.
+
+    - The calculation of 50% continues to be based on all 5 Redis servers, not the remaining active ones, to prevent potential inconsistencies.
 
 ## Comparison of Approaches
 
 1. **Single Redis Node:** Simple but introduces a single point of failure.
+
 2. **Multiple Independent Redis Servers:** Ensures high availability and fault tolerance, but reduces throughput.
-3. **Redis Read Replicas:** While replicas provide redundancy, they might lead to stale reads and incorrect lock acquisition due to replication lag.
+
+3. **Redis Read Replicas:** 
+
+    - **Asynchronous updates:**
+        
+        In a **read replica setup**, correctness can be compromised due to the delay in replication from the master node to the replicas. This creates a window where multiple transactions might incorrectly perceive the lock as available and acquire it simultaneously, leading to conflicts. Additionally, if the **master node fails** before the changes propagate to the replicas, inconsistencies can arise, as some replicas may not yet have the updated state.
+
+        If asynchronous updates are used between the master and replicas, this issue becomes more pronounced, with potential correctness violations during the replication lag.
+
+    - **Synchronous updates:**
+
+        To mitigate this, synchronous updates can be employed, ensuring that all replicas are updated simultaneously. However, this comes with a tradeoff: if one replica node goes down during the synchronous update, the transaction could be blocked, waiting for the failed node to recover, which in turn **decreases availability**. Thus, while synchronous replication ensures consistency, it can impact the system's availability during node failures.
+
+![](Pictures/14.png)
+
+---------------------------
+
+> Disclaimer:
+> Arpit shows the code for Synchronous and Asynchronous, do it by yourself
+
+---------------------------
