@@ -95,7 +95,7 @@ Yes this system may face throughput limitations but it works well within Flickr�
 
 ![](Pictures/19.png)
 
-#### MySQL Table Structure
+### MySQL Table Structure
 
 In Flickr's ID generation system, the **ticketing server** relies on a two-column design, consisting of an `id` (which is the primary key) and a `stub`, which is a **single-character field**.
 
@@ -107,7 +107,7 @@ However, the process of **deleting a row** and then **inserting** a new characte
 
 ![](Pictures/20.png)
 
-## MySQL Optimizations:
+### MySQL Optimizations:
 - Instead of DELETE and INSERT operations to generate new IDs (which are expensive), MySQL provides two efficient options:
     1. `INSERT … ON DUPLICATE KEY UPDATE:` 
         - This tries to insert a row, and if it fails due to a unique key constraint, it updates the row.
@@ -129,7 +129,7 @@ However, the process of **deleting a row** and then **inserting** a new characte
 
     ![](Pictures/21.png)
 
-## Single Point of Failure in Ticketing System
+### Single Point of Failure in Ticketing System
 In the current setup -- 
 1. The Client makes a request to create a post.
 2. The Server sends a request to the Ticketing Server to retrieve a unique ID for the post.
@@ -145,3 +145,109 @@ To address this, we add more servers, and a gossip protocol is needed for commun
 The solution involves using two MySQL database servers, where instead of simply incrementing the counter (`counter++`), they increment the counter by 2 (`counter+=2`). One server starts from 1 and the other starts from 2. As a result, one server generates odd IDs and the other generates even IDs, ensuring that both servers generate unique IDs continuously. This approach avoids the single point of failure, but it sacrifices monotonicity, which is acceptable in this specific scenario.
 
 ![](Pictures/23.png)
+
+## Calculate cumulative size of indexes
+
+### PostgreSQL
+PostgreSQL provides functions like pg_total_relation_size() to calculate the size of indexes on a table.
+
+To get the size of all indexes on a specific table:
+```sql
+SELECT pg_size_pretty(pg_indexes_size('your_table_name'));
+```
+
+To get the cumulative size of all indexes in the entire database:
+
+```sql
+SELECT pg_size_pretty(SUM(pg_relation_size(indexrelid)))
+FROM pg_index;
+```
+
+### MySQL
+In MySQL, the `information_schema` table stores details about the size of indexes.
+
+To calculate the size of all indexes in a specific table:
+```sql
+SELECT table_name AS `Table`, 
+       ROUND(SUM(index_length) / 1024 / 1024, 2) AS `Index Size (MB)`
+FROM information_schema.tables
+WHERE table_schema = 'your_database_name'
+GROUP BY table_name;
+```
+This will give the index size per table, and you can sum it up to get the total index size for the whole database.
+
+## Snowflake ID Generation: Twitter and Instagram Use Cases
+
+### Snowflake: Twitter
+Snowflake is an ID generation algorithm designed to generate unique identifiers for Twitter objects such as tweets, users, and messages. These IDs are 64-bit integers broken into three parts:
+
+1. **41 bits:** Epoch timestamp in milliseconds.
+
+2. **10 bits:** Machine ID, which represents the API server's unique identifier. The challenge is ensuring that every new server that starts up has a distinct machine ID. Since 10 bits are allocated for this purpose, it allows for 1024 unique machine IDs. When a new server spins up, it must communicate with a configuration database to acquire the first available machine ID. This process is similar to the pattern of allocating limited resources, such as users competing for a limited number of seats in a system. The server requests an ID, and the configuration database assigns one that is available, ensuring no two servers have the same ID.
+
+3. **12 bits:** A per-machine counter that can generate 4096 unique IDs per millisecond.
+
+This setup allows each server to generate 2^12 (4096) unique IDs in 1 millisecond. Since each app server has a unique machine ID, there’s no collision across servers.
+
+![](Pictures/24.png)
+
+The snowflake ID generator runs as a native function in the application server, eliminating the need for network calls or external dependencies, making it highly efficient. While this approach doesn’t guarantee strict monotonicity, the IDs are roughly sortable by time since the timestamp is part of the structure.
+
+Twitter uses **cursor-based pagination** instead of limit-offset pagination. In this method, you provide the ID of the last tweet you viewed, and the Twitter API returns the tweets that follow that ID. Similarly, DynamoDB uses a combination of a hash key and a sort key for pagination. In the API response, it provides a **"last evaluated key"** and an **"exclusive start key,"** which act as markers to retrieve the next set of results. This approach is more efficient than limit-offset pagination because it directly navigates to the next data chunk, avoiding the need to scan skipped records.
+
+![](Pictures/25.png)
+
+### Cursor-Based Pagination vs. Limit-Offset Pagination
+**Cursor-Based Pagination** is more efficient than limit-offset pagination because it leverages the structure of the B+ tree, which stores leaf nodes ordered by the primary key. When performing cursor-based pagination (e.g., using `id > n`), the system takes logarithmic time (`logn`) to find the starting point and then fetches the next `k` records sequentially, resulting in a time complexity of `logn + k`.
+
+In contrast, Limit-Offset Pagination requires the system to scan and skip records. For instance, if you want to retrieve rows after skipping the first 200, the system must evaluate and skip those 200 rows before fetching the needed data, which is less efficient. This additional scanning makes limit-offset pagination slower, especially with larger datasets.
+
+Despite its inefficiency, limit-offset pagination is necessary for cases where complex filters (e.g., multiple `WHERE` and `HAVING` clauses) are involved. Some systems, like Elasticsearch, offer both pagination methods. For standard queries, limit-offset pagination is available, but beyond a certain limit, Elasticsearch switches to its **Scroll API** for cursor-based pagination, which stores the result set separately and allows for efficient navigation through the results.
+
+A good analogy is Google search: while there may be thousands of matching results, Google shows only 10 results per page, with users scrolling to subsequent pages as needed—similar to how pagination works with Elasticsearch's Scroll API.
+
+### Snowflake: Instagram
+
+Instagram's version of Snowflake is tailored to meet the platform’s requirements for batch processing and time-based sorting of posts. Like Twitter, they wanted efficient 64-bit IDs for indexing, but they required the ID generation to be sorted by time for displaying posts in a user’s feed.
+
+Instagram’s 64-bit ID structure:
+
+1. **41 bits:** Epoch timestamp in milliseconds (since Jan 1, 2011).
+2. **13 bits:** Database shard ID (up to 8096 logical shards).
+3. **10 bits:** Per-shard sequence number, allowing 1024 IDs per millisecond per shard.
+
+In 1 millisecond, across 8,096 database shards, the system can generate 1,024 different IDs, totaling around 8 million IDs per millisecond. These 8,096 logical shards are not physical entities but virtual partitions, allowing scalability by logically splitting data across physical servers.
+
+Each physical server hosts multiple logical shards, meaning that while there are fewer physical machines, each holds hundreds of logical shards. Think of creating a database in MySQL as creating one of these logical shards.
+
+This setup makes horizontal scaling seamless since the system treats the database as already partitioned across different servers. This solves the hotspot problem, where a single physical server gets overwhelmed with traffic. For example, if two servers, VM1 and VM2, hold data, and VM2 starts becoming overloaded, the system can identify and transfer less busy shards to other servers, thereby distributing the load efficiently.
+
+Without logical shards, moving data from one machine to another would require scanning and copying individual rows, which is time-consuming. However, with logical shards, you can transfer entire shards in bulk, which is much faster. Additionally, adding new physical servers becomes easier—simply move some logical shards to the new machine, enhancing scalability and load balancing.
+
+![](Pictures/26.png)
+
+Each shard contains a post table (e.g., `insta5.post`), and when a post is created, the `id` column, instead of auto-generating, calls a stored procedure (e.g., `insta5.next_id()`) to retrieve a unique ID. The databases are named `insta5`, `insta6`, etc., with each having its own stored procedure for ID generation, like `insta5.next_id()` or `insta6.next_id()`. The stored procedure calculates the timestamp, shard ID, and sequence number, ensuring the IDs are unique within the platform without relying on an external service.
+
+![](Pictures/27.png)
+![](Pictures/28.png)
+
+This approach keeps the ID generation logic within the database itself, making it a great use case for stored procedures in production environments,  proving that they can be valuable even at scale.
+
+----------
+> Disclaimer: Arpit shows code here for snowflake in instagram`, do it by yourself. 
+--------
+
+### Snowflake: Discord
+
+Discord's implementation of Snowflake is nearly identical to Instagram’s, except that their epoch starts at the beginning of 2015, the year Discord was founded.
+
+![](Pictures/29.png)
+
+#### Advantages of Snowflake Algorithm
+1. **Scalability:** Snowflake can generate a massive number of unique IDs per millisecond across multiple servers, enabling distributed systems to scale effectively.
+
+2. **Decentralized:** Snowflake runs as a native function, removing the need for centralized ID generation services or network calls, ensuring low latency.
+
+3. **Customizable:** Companies like Instagram and Discord have customized Snowflake for their specific use cases, such as defining custom epoch start dates or adding unique bits for machine IDs and sequence numbers.
+
+By using Snowflake, companies can avoid the inefficiencies of UUIDs, which are larger in size, harder to index, and may lead to higher disk usage and slower query times in databases. Snowflake's IDs are smaller, efficient, and can be roughly sorted by time, making them ideal for high-performance distributed systems.
