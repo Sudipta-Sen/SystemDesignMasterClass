@@ -148,3 +148,36 @@ abc456.jpg
 ```
 
 Then, construct the full URL when serving the image by prepending the `CDN URL` and `bucket name` and `user id`. If the CDN provider changes, we only need to update the base URL in our application logic without altering the database records. This approach is more efficient, reduces storage space, and simplifies maintenance.
+
+## Privacy Concerns in Handling Private Photos on Platforms like Instagram
+
+---
+> Disclaimer: Arpit provides an insightful demonstration that shows how private photos might not be entirely private on platforms like Instagram.
+---
+
+The key issue arises from how easy it can be for someone with access to a private post to inspect the URLs of the associated images and videos via the browser's developer tools. These URLs point to the CDN-stored media, as Instagram serves its content via a CDN.
+
+
+This URL can be easily copied and shared, allowing anyone with the link to access and download the supposedly private image.
+
+However, these URLs are embedded with public key cryptography details that authenticate the user’s access to view the image but only until the credentials expires. 
+
+**Instagram’s Approach to Privacy:** When we try to access a user’s private account in incognito mode or from an unauthorized account, Instagram denies access because it doesn’t receive an access token. If we use an authorized account, Instagram checks if that account has permission to view the user’s profile. This authorization is the critical point where access is either granted or denied.
+
+**The Role of CDN:** Photos and videos are served to users via a CDN. The URL format is as we discussed earlier:
+
+```bash
+https://<cdn_domain_name>/<s3_bucket_name>/<user_id>/random_image_id.extension
+```
+
+To access Instagram's private photos, the critical factor is passing the appropriate authentication parameters. Photos and videos are served to users via a CDN, but the CDN itself does not have the capability to know whether a user is authorized to view a particular image. The access control is managed by Instagram’s database, which verifies who has permission to access the content. Therefore, Instagram embeds cryptographic information into the media request, ensuring the CDN serves the content only to authorized users. 
+
+Since the CDN and Instagram’s database cannot communicate directly to verify access, public key cryptography is used as the bridge between the systems. The cryptographic parameters are included in the request to ensure that only authorized users can access the media. These parameters also come with an expiration time to prevent long-term unauthorized access.
+
+But CDN only checks the cryptographic signature embedded within the URL to verify if the request is legitimate. Someone else having this link (e.g., by inspecting browser elements), also can access the content until the cryptographic token embedded in the URL expires.
+
+**Public and Private Key System:** While public keys are available to everyone, only Instagram holds the user’s credentials. This ensures that only Instagram can generate a valid cryptographic link. However, once generated, the CDN, which possesses the private key, can decrypt and serve the requested image. The CDN does not have insight into the user's credentials; its role is only to serve content based on whether the cryptographic signature matches the private key.
+
+**Summary:** This approach ensures that the CDN can validate requests but lacks the capability to identify the user directly, as only Instagram maintains the detailed credentials and user access rights. However, anyone with access to the cryptographic link can temporarily bypass these access controls until the link's expiration, which presents a minor risk in content protection.
+
+![](Pictures/5.png)
