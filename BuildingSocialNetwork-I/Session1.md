@@ -90,19 +90,77 @@ To enable direct uploads without compromising security, the process can be split
     - The client makes a POST request directly to S3 using the presigned URL, uploading the image.
     - Since the upload happens directly with S3, it reduces the load on the API server.
 
-    ![](Pictures/4.png)
+Once the user successfully uploads an image and receives the corresponding image URL, the user API will send a request to the Post Service. Post Service then creates a new entry in the Post DB including the image URL and user details.
+
+![](Pictures/4.png)
 
 **Benefits:**
 - **Reduced Infrastructure Costs:** The number of API servers and their memory requirements are reduced as the API server no longer holds large files temporarily.
 - **Short-lived Credentials:** The presigned URL has expiration info baked in, so there’s no need to manage expiration manually.
 - **No Long TCP Connections:** By eliminating long-running TCP connections, fewer API servers are needed, further optimizing resource usage.
+
+### c. Public Key Cryptography in Image Upload Service
+
+In a system where two services (or microservices) need to interact securely without direct access to each other's data, public key cryptography plays a crucial role.
+
+#### Problem Overview
+
+- **Auth Service:** Manages user authentication and stores sensitive information such as emails, passwords, and tokens in its Auth DB.
+
+- **Post Service:** Manages users' posts and stores post-related data in its Post DB.
+
+The challenge arises when the **Post Service** needs to ensure that the request it receives is from an authenticated and legitimate user. The Post Service must validate the user's identity without having direct access to the Auth DB or calling the Auth Service every time a validation is needed. We aim to make the Post Service independent of other services during validation.
+
+#### Initial Solutions and Their Problems
+
+1. **Call Auth Service to Validate Token:**
+
+    - User sends a authentication token (received from Auth Service) to post service while making a post request. Post Service calls the Auth Service to check the validity of the authentication token by querying the Auth DB. If valid, the Auth Service confirms this to the Post Service, which then processes the request.
+
+    - **Issue:** This creates a dependency where the Post Service is not self-contained, as it must rely on the Auth Service for validation.
+
+2. **Post Service Accessing Auth DB Directly:**
+
+    - Post Service is granted access to the Auth DB, allowing it to validate the token without calling the Auth Service.
+
+    - **Issue:** It still creates a dependency. The Post Service is not fully autonomous.
+
+In both cases, the Post Service is dependent on another system (Auth Service or Auth DB) to validate the token
+
+#### JWT and Public Key Cryptography Solution
+
+To address these concerns, we can use **JSON Web Tokens (JWT)** to make the Post Service self-sufficient for token validation.
+
+- **JWT Token:** When a user authenticates via the Auth Service, they receive a JWT token, which contains three parts:
+
+    1. **Header:** Specifies the algorithm used to generate the signature.
+    2. **Payload:** Contains claims such as the user's information (e.g., user ID).
+    3. **Signature:** Generated using the private key of the Auth Service and based on the header and payload.
+
+        ![](Pictures/6.png)
+
+- **How Validation Works:**
+
+    1. When the user sends a request to the Post Service, they include the JWT token.
+
+    2. The Post Service can now validate the JWT without calling the Auth Service or accessing the Auth DB.
+        - The Post Service uses the public key (shared and accessible by anyone) to verify the token’s signature.
+
+        - The **private key**, which is only with the Auth Service, is used to generate the signature when the JWT is created.
     
+    3. If an attacker attempts to modify the payload (e.g., change the user ID), they cannot change the signature because they do not have access to the private key. The Post Service will detect this change when validating the token.
+
+        ![](Pictures/7.png)
+
+    This process ensures that the Post Service can securely verify the authenticity of the request without any external dependency.
+
+
 ---
 > Disclaimer: 
 >> 1. Arpit provides a real-world demo of all this with github — check it out.
 ---
 
-### c. Optimizing Image URLs in the Post DB
+### d. Optimizing Image URLs in the Post DB
 
 Let’s consider an issue with how image URLs are stored in the POST DB when using a CDN for serving images. Suppose the images are uploaded to an S3 bucket named **insta-images**, and the path for each image is structured as:
 
@@ -132,7 +190,7 @@ A bigger issue arises when you need to change the CDN provider. For instance, if
     ```bash
     https://instacdn.net/insta-images/123/abc456.jpg
     ```
-Having the full URL in the database means you would need to update every entry in the **POST DB**, which can be a costly and error-prone operation.
+Having the full URL in the database means we would need to update every entry in the **POST DB**, which can be a costly and error-prone operation.
 
 **Solution:**
 Only store the dynamic part of the URL (the image path) in the **POST DB**. The constant **CDN URL** and **bucket name** can be dynamically constructed when needed. For example, store only:
@@ -149,7 +207,13 @@ abc456.jpg
 
 Then, construct the full URL when serving the image by prepending the `CDN URL` and `bucket name` and `user id`. If the CDN provider changes, we only need to update the base URL in our application logic without altering the database records. This approach is more efficient, reduces storage space, and simplifies maintenance.
 
-## Privacy Concerns in Handling Private Photos on Platforms like Instagram
+### e. Image Upload and Post Creation with Kafka Integration
+
+The **Image Service** interacts with S3 to generate a **pre-signed URL**, which is then used by the user to upload the photo directly to S3. After the upload, the user requests the **Post Service** to create the post using the image URL. Once the post is successfully created in the **Post DB**, an event is published to Kafka by **Post Service**. Services like notifications for subscribed users, user feed updates, and analytics act as Kafka consumers, processing the event to ensure real-time updates and seamless platform integration.
+
+![](Pictures/8.png)
+
+## 3. Privacy Concerns in Handling Private Photos on Platforms like Instagram
 
 ---
 > Disclaimer: Arpit provides an insightful demonstration that shows how private photos might not be entirely private on platforms like Instagram.
@@ -176,7 +240,7 @@ Since the CDN and Instagram’s database cannot communicate directly to verify a
 
 But CDN only checks the cryptographic signature embedded within the URL to verify if the request is legitimate. Someone else having this link (e.g., by inspecting browser elements), also can access the content until the cryptographic token embedded in the URL expires.
 
-**Public and Private Key System:** While public keys are available to everyone, only Instagram holds the user’s credentials. This ensures that only Instagram can generate a valid cryptographic link. However, once generated, the CDN, which possesses the private key, can decrypt and serve the requested image. The CDN does not have insight into the user's credentials; its role is only to serve content based on whether the cryptographic signature matches the private key.
+**Public and Private Key System:** While public keys are available to everyone, only Instagram holds the user’s credentials and private key. This ensures that only Instagram can generate a valid cryptographic link. However, once generated, the CDN, which possesses the public key, can decrypt and serve the requested image. The CDN does not have insight into the user's credentials; its role is only to serve content based on whether the cryptographic signature is valid or not.
 
 **Summary:** This approach ensures that the CDN can validate requests but lacks the capability to identify the user directly, as only Instagram maintains the detailed credentials and user access rights. However, anyone with access to the cryptographic link can temporarily bypass these access controls until the link's expiration, which presents a minor risk in content protection.
 
