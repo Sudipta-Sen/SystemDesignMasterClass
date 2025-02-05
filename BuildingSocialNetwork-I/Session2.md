@@ -132,3 +132,47 @@ Now, let's consider the `is_active` column in the `photos` table and the `(user_
     ```
 
     This drastically reduces the size of the index to match only active photos, making DB queries faster.
+
+## Database Optimization
+
+Since `is_active` is a singular property for each user (only one photo can be active at a time), we can optimize the schema by removing the `is_active` column from the photos table. Instead, we can add an `active_photo_id` column in the users table, which will be a foreign key referencing `photo_id` in the `photos` table. This eliminates the need for the `is_active` column and simplifies our queries.
+
+The new structur of `User` and `Photos` tables will be:
+
+- **User:** `user_id` (primary key), `email` (unique key), `active_photo_id` (foreign key)
+- **Photos:** `photo_id` (primary key), `user_id` (foreign key)
+
+The query to retrieve the active photo becomes:
+
+```sql
+SELECT active_photo_id
+FROM users
+WHERE hash = ?
+```
+Updating the user's active photo becomes:
+```sql
+UPDATE users
+SET active_photo_id = ?
+WHERE hash = ?
+```
+Both queries are now simpler and more efficient.
+
+## Serving the Photo via CDN
+
+Now that we have discussed the database structure, let's move on to how the photo will be served. At a large scale, we will use a CDN to deliver the photos efficiently.
+
+The CDN URL could be something like `cdn.gravatar.com`, with the origin server being `api.gravatar.com`. Here, the origin server is the API server, not S3, because only the API server knows which photo is currently active for a user.
+
+Here’s how the flow works:
+
+1. When a user or a website requests the gravatar service by hitting the URL `cdn.gravatar.com` with the email hash, the request is sent to the CDN.
+
+2. If the CDN has cached the photo, it serves the image immediately.
+
+3. If the CDN doesn’t have the photo, the request is forwarded to the API server (`api.gravatar.com`).
+
+4. The API server fetches the active photo URL from the database, retrieves the photo from S3, and sends it back to the CDN.
+
+5. The CDN caches the photo and serves it to the user.
+
+**Note:** explore the concept of OG (Open Graph) images, which follows a similar pattern.
