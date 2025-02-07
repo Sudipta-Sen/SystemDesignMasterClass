@@ -164,4 +164,141 @@ In this system, the top 100 posts for a hashtag are provided by the data science
     
     - Since the partitioning key is consistent, all these Kafka consumers will receive events for the same user from the same partition, maintaining efficient processing across different services.
 
+## 7. Hashtag Post Count Increment
+
+When building a service to track the count of posts for hashtags (e.g., in a social media application), a naive implementation can cause significant scalability and performance issues. Let's explore several approaches to optimize this system, focusing on reducing database load and improving parallelism in processing.
+
+### Approach 1: Increment Total Posts for Tags
+
+- **Method:**
+
+    1. Extract hashtags from post captions.
+    2. For each tag, increment the total post count by 1 in the database.
+
+        ```Python
+        tags = extract(msg.text)
+        for tag in tags:
+            dbInc(tag, total_posts, 1)
+        ```
+- **Pros:**
+    1. Simple and straightforward method to update post counts for each tag.
+    2. Ensures real-time updates with every post, reflecting the immediate status of total posts for each tag.
     
+- **Cons:**
+    1. **High Write Load:**
+
+        - Each post triggers multiple writes to the database. For platforms like Twitter, with 100,000 posts per minute and an average of 8 tags per post, this results in approximately 800,000 write operations to the database every minute. This creates a significant strain on the database.
+    
+    2. **Limited Parallelism & Slower Processing:**
+
+        - The tag processing is slow because for each message, it loops through all tags and increments the total post count for each one. The parallelism is constrained by the number of Kafka partitions, as only one consumer in a group can read from a partition. This limited parallelism can lead to higher staleness in tag count data.
+
+- **Result**
+
+    - This method ensures that tag counts remain relatively up-to-date but suffers from performance issues due to high write volume and limited parallelism. A batch increment strategy can reduce some of the load, improving performance but reduce accuracy by introducing staleness in the system.
+
+###  Approach 2: Using Redis for Intermediate Increment of Tag Counts
+
+- **Method:**
+    1. The Kafka consumer acts as a hashtag extraction service. For each tag in a post, it creates or updates a key in Redis, where the key is the tag and the value is the total number of posts for that tag.
+
+    2. Each increment operation in Redis is fast as Redis resides within the same network as the hashtag consumer.
+
+    3. A separate counter service reads all the keys from Redis periodically, retrieves the value (total post count for each tag), updates the hashtag database, and resets the Redis value to 0.
+
+        Code of Counter Service:
+        ```Python
+        for key in redis.keys():
+            val = redis.getValue(key)
+            dbInc(key, total_posts, val)  # Increment DB total for the tag
+            redis.setValue(key, 0)
+        ```
+
+        ![](Pictures/5.png)
+
+- **Pros:**
+
+    - **Faster Updates:**
+        
+        Redis allows for quick, intermediate increments in memory, which reduces the immediate load on the database and speeds up the hashtag extraction process.
+
+    - **Reduced Write Pressure on DB:**
+        
+        By aggregating increments in Redis and periodically updating the hashtag DB in batches, this approach minimizes the frequency of direct writes to the main database.
+
+- **Cons:**
+
+    1. **Expensive Redis Query (`redis.keys()`):**
+
+        The `redis.keys()` operation is highly expensive and time-consuming in large-scale production environments. In fact, it is often banned due to the high performance cost, as it locks Redis during the operation, leading to a "stop the world" issue.
+
+    2. **Redis as a Single Point of Failure:**
+
+        Redis becomes a single point of failure unless it is run in a clustered mode. This adds complexity and requires extra overhead to ensure high availability and fault tolerance.
+
+    3. **Additional Service Overhead:**
+
+        Introducing a new counter service that processes Redis data and manages uptime adds maintenance and operational complexity.
+
+- **Result:**
+
+    - While Redis allows for faster intermediate updates and reduces the immediate write load on the database, the performance bottleneck caused by querying Redis keys (`redis.keys()`) makes this approach inefficient for large-scale production. Moreover, Redis can become a single point of failure, requiring additional resources to mitigate these risks. Given the overhead and risks involved, this approach may not be optimal for handling large-scale data processing.
+
+### Approach 3: Using Kafka for Hashtag Processing
+
+- **Method:**
+    - The hashtag extraction service reads posts from a Kafka topic, extracts hashtags, and writes the data back into another Kafka topic, partitioned by hashtags.
+    
+    - For each hashtag in a post, an event is created in the second Kafka topic as `<post_id, hashtag>`.
+    
+    - If a post contains multiple hashtags, multiple events are generated.
+    
+    - This ensures that all events related to the same hashtag land in the same partition, allowing the counter service to consume events from specific partitions.
+    
+    - The counter service counts the total posts for each hashtag over a set interval and updates the hashtag database accordingly.
+
+        ![](Pictures/6.png)
+
+- **Pros:**
+
+    - Parallel processing is enhanced by Kafka partitions, as each partition is processed by an independent consumer.
+
+    - Each unique hashtag is processed by a single consumer. Hashtags are processed in batches for efficiency, reducing the number of writes to the database.
+
+- **Cons:**
+
+    - **High event volume:** For a post with multiple hashtags, the system generates multiple events, which can overwhelm Kafka with a large number of events.
+
+    - **Limited parallelism:** The parallelism of the counter service is constrained by the number of partitions, meaning that each consumer can only process events for one partition at a time.
+
+- **Result:** 
+
+    This approach uses Kafka to balance load distribution but introduces the challenge of event flooding, especially for posts with many hashtags. The efficiency of counting and updating the database depends on partitioning, but this may still lead to bottlenecks based on the number of events per partition.
+
+### Approach 4: Local Batching with In-Memory Storage
+
+- **Method:**
+    - Instead of using central storage like Kafka or Redis, we store post counts for each hashtag locally in the memory of each hashtag extraction API server.
+
+    - Each server maintains a hash map `HashMap<tag, int>`, where `int` stores the count of posts for that hashtag.
+
+    - Multiple API servers may process the same hashtag independently, leading to local optimization rather than global.
+
+    - The post count for a hashtag is updated either after a certain interval or when a threshold count `n` (e.g., 10) is reached. After updating, the counter for the hashtag is reset to 0.
+
+- **Pros:**
+    - Reduces reliance on external systems like Redis or Kafka, leading to faster processing as data is handled in-memory.
+
+    - Efficient for local batch processing, reducing the frequency of database writes.
+
+    - Simpler architecture without needing to manage external services like Redis or Kafka.
+
+- **Cons:**
+    - Lack of global synchronization across multiple API servers.
+
+    - Possibility of data staleness as each server updates its counts independently.
+
+    - Risk of memory limitations if the hashtag count grows significantly in each server.
+
+- **Result:**
+    - This approach improves performance by leveraging in-memory storage for local batching, but sacrifices global accuracy as multiple servers  store and update the same hashtag independently. It is suitable when some level of staleness is acceptable, and frequent DB writes are to be avoided. As per our requirement, this is the best approach so far.
