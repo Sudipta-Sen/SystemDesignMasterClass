@@ -275,6 +275,8 @@ When building a service to track the count of posts for hashtags (e.g., in a soc
 
     This approach uses Kafka to balance load distribution but introduces the challenge of event flooding, especially for posts with many hashtags. The efficiency of counting and updating the database depends on partitioning, but this may still lead to bottlenecks based on the number of events per partition.
 
+    ![](Pictures/8.png)
+
 ### Approach 4: Local Batching with In-Memory Storage
 
 - **Method:**
@@ -284,7 +286,7 @@ When building a service to track the count of posts for hashtags (e.g., in a soc
 
     - Multiple API servers may process the same hashtag independently, leading to local optimization rather than global.
 
-    - The post count for a hashtag is updated either after a certain interval or when a threshold count `n` (e.g., 10) is reached. After updating, the counter for the hashtag is reset to 0.
+    - The post count for a hashtag is updated either after a certain interval or when a threshold count `n` (e.g., 10) is reached, based on the total number of posts read rather than the individual tag count. This approach ensures that even rare hashtags get updated. If we were to base the threshold on the number of posts for a specific tag (e.g., updating when a tag reaches 100 posts), a rare tag might never reach that threshold and would never be updated in the hashtag DB. By using the number of posts read as the trigger, we guarantee that all hashtags are regularly updated.
 
 - **Pros:**
     - Reduces reliance on external systems like Redis or Kafka, leading to faster processing as data is handled in-memory.
@@ -302,3 +304,97 @@ When building a service to track the count of posts for hashtags (e.g., in a soc
 
 - **Result:**
     - This approach improves performance by leveraging in-memory storage for local batching, but sacrifices global accuracy as multiple servers  store and update the same hashtag independently. It is suitable when some level of staleness is acceptable, and frequent DB writes are to be avoided. As per our requirement, this is the best approach so far.
+
+### Multithreading Optimization in Hashtag Extraction Service
+
+This multithreading optimization applies to the last three approaches, but we'll use **Approach 4** as a reference. In **Approach 2** and **Approach 3**, this optimization is applicable to the **counter service**, while in **Approach 4**, it applies to the hashtag extraction service.
+
+- **Method:**
+    - Suppose in Approach 4, we update the hashtag DB after consuming every 1000 posts.
+    
+    - The basic algorithm increments the tag count in a hash map for every post processed.
+
+        ```Python
+        count_post = 0
+        for msg in kafka:
+            tags = extract(msg.text)
+            for tag in tags:
+                m[tag]++
+            count_post++
+            if count_post == 1000:
+                for tag, count in m:
+                    db.Inc(tag, total_posts, count)
+                m.clear()
+        ```
+
+- **Problems:**
+    1. **Concurrency Issues:**
+    
+        Multiple API servers may update the DB at the same time, leading to inconsistencies. However, database systems usually handle concurrency via internal locking mechanisms, so `db.Inc` can manage this.
+
+    2. **Multi-Threading:**
+    
+        The code isn't CPU-intensive, so multiple consumer threads can be spun up on a machine. Each thread can run this code in parallel, improving efficiency. 
+
+        Even with a single consumer, we can still spawn additional threads to handle the extraction and tag count increment in parallel (lines 3-5 of the algorithm). Since hashtag extraction can be computationally expensive, processing separate messages in parallel optimizes resource usage and prevents unnecessary CPU hogging.
+
+        Overall, the system naturally moves toward a multi-threaded design, improving efficiency and throughput.
+
+        ![](Pictures/7.png)
+
+- **Critical Sections:**
+    - **Atomic Increment:** 
+    
+        The increment operation (`++`) is not atomic, which means every `++` is a critical section where a lock is required to ensure thread safety. To avoid explicitly managing locks, we can use a `ConcurrentHashMap` for the hashmap (`m[tag]++`) and replace the value type with an `AtomicInteger`. This ensures that each increment operation is thread-safe without needing manual synchronization.
+    
+    - **Stop-the-World Block:**
+
+        When the condition `count_proc == 1000` is met, we iterate through the map to update the database and clear the map. This operation must be atomic, meaning that during this process, the tag extraction step should not modify the map. This creates a "stop-the-world" problem, where we block further operations while the map is processed.
+
+        Using an embedded database like SQLite may seem like a solution, but it doesn't resolve the issue because we still need to read from the embedded database and update the hashtag database, leading to the same problem. The time-consuming nature of updating the database for each tag requires us to minimize this stop-the-world period.
+
+        An alternative could be replacing the `db.Inc` operation with Kafka by creating a Kafka topic with `<tag, count>`. However, even in this case, the entire map must be written to Kafka before clearing it, again causing a stop-the-world scenario.
+
+        This "stop-the-world" process only affects **a single hashtag extraction API server**, while **other servers continue functioning in parallel** since each operates independently with its own instance of the code.
+
+        ![](Pictures/10.png)
+
+- **Solutions:**
+
+    The root cause of this issue is that while the map is being read and cleared, no modifications should occur i.e the data we are reading should not be modified. A potential solution is to create a deep copy of the map data. Once we have the deep copy, we can safely clean the original map and continue processing new tags while the deep-copied data is used for database updates or other operations in parallel.
+
+    - **Approach1: Deep Copy**
+        - **Method:**
+            - When a threshold is reached (e.g., after 1000 posts), the system pauses to handle the current map data.
+            -  A deep copy of the hashtag count map is created for safe processing.
+            - A separate thread is spawned to update the database using the deep copy.
+            - The original map is cleared, and the post counter is reset, allowing the hashtag extraction process to resume immediately.
+            -  Database updates occur in the background, and the system continues to extract tags, minimizing downtime.
+        
+            This ensures minimal blocking and efficient parallel processing. 
+
+            ![](Pictures/11.png)
+        
+        - **Disadvantages:**
+            - Creating a deep copy takes time, though it's faster than directly updating the DB or pushing events to Kafka/Redis.
+
+            - The memory requirements double because, after creating the deep copy but before clearing the original map, both the original and the deep copy exist simultaneously, leading to increased memory usage.
+
+    - **Approach2: Dual HashMap**
+        - **Method:**
+            - Use two hash maps: an **active map (ma)** and a **passive map (mp)**.
+
+            - Initially, both maps are empty. Extracted tag-post counts are stored in the active map.
+
+            - When the counter hits 1000, enter the critical section, swap the maps (`ma` and `mp`), and release the lock.
+
+            - The active map (`ma`) is reset, and a new thread updates the DB using the passive map (`mp`).
+
+            - This approach avoids memory spikes since map swapping only involves reference changes.
+
+                ![](Pictures/12.png)
+        
+        - **Pros:**
+            - The dual hash map approach prevents memory doubling while minimizing stop-the-world time.
+
+            - Forking new threads for DB updates while continuing tag extraction improves overall performance.
