@@ -83,3 +83,63 @@ To track memory usage, every time we call `malloc`, we can also increment a `tot
 Similarly, Redis uses a `zfree` function to wrap `free`, which updates `total_size` by subtracting the released memory. The details of these functions can be found in Redis's source code (`zmalloc.c` and `zfree.c`). This internal tracking system ensures efficient and accurate memory management in the cache
 
 By using these custom wrappers, Redis efficiently tracks memory usage without the need for expensive system calls, ensuring optimal performance.
+
+**Question1**: How do we know how many bytes to allocate for each data type in C?
+
+**Answer:** We use the `sizeof` operator to determine the exact amount of memory required for each data type. For example, when creating a tree node in C, we use `malloc(sizeof(struct node))`. This ensures we allocate the correct number of bytes, allowing us to keep the `total_size` variable updated and track memory usage accurately.
+
+**Question2:** How do we ensure that our cache does not exceed the maximum memory limit?
+
+**Answer:** Before allocating memory, we check if the current `total_size` plus the new memory to be allocated would exceed the maximum limit. If it does, we call the eviction mechanism to free up space by removing some keys until the required memory becomes availbale. This approach prevents the system from breaching the maximum memory limit.
+
+![](Pictures/2.png)
+
+### Eviction Techniques and Implementation in Cache
+
+Two widely used eviction techniques are **LRU (Least Recently Used)** and **LFU (Least Frequently Used)**.
+
+**Question:** How can we implement LRU in a hash table as an eviction policy?
+
+**Answer:** To implement LRU, we need a linked list. Each node in this linked list should contain a pointer to the next node and the key, represented as a char *. The basic structure of a node could look like this:
+
+```c
+struct node {
+    struct node *p;
+    char *key;
+}
+```
+This is the bare minimum, but additional metadata may be needed.
+
+- **Size Calculation for Linked List Overhead:**
+
+    Each node in the linked list contains two pointers (each 8B in size on a 64-bit system), so the total size of a node is 16B. For 1 million keys in the cache, we would need 16MB of RAM just to store the linked list. This overhead is significant since everything is stored in RAM.
+
+- **Trade-offs:**
+
+    The challenge is the overhead of metadata (linked list) for managing eviction. 
+    - One alternative is random eviction, where no metadata is stored, and random keys are evicted. However, the downside is the potential eviction of keys that may be needed in the future. The benefit is using the extra memory (16MB in this case) for storing additional keys instead of metadata.
+
+    - Another option is to implemented LRU without a linked list. Here we would need to iterate through each key and find out which was least recently used, which increases the time complexity for eviction.
+
+- Three Considerations for any choice for system design:
+    - Space: Linked list metadata consumes space.
+    - Time: Eviction without metadata is slow.
+    - Correctness: Random eviction risks evicting important keys.
+
+- **Optimizing the Second Approach (random eviction):**
+
+    Instead of random eviction, we can improve by sampling a subset of keys and evicting the least recently used (local maximization instead of global). Redis implements this with an eviction pool of 15 elements. This pool contains keys that are good candidates for eviction. When LRU is triggered, Redis removes the least recently used key from the pool until sufficient space is freed. Redis also runs periodic jobs to update the eviction pool by randomly picking keys and keeping the least recently used keys in the pool.
+
+### Implementing TTL (Time-to-Live) in Cache
+
+**Question:** How can TTL (Time-to-Live) be implemented in cache?
+
+**Answer:** Since we store the value as a struct, we can add a field for the expiration timestamp in the same struct. This timestamp is calculated by adding the current time to the TTL when the key is created or updated. The challenge is identifying expired keys and removing them.
+
+- Approaches for Removing Expired Keys:
+
+    - **Approach-1:** During the eviction job, check all keys to find expired ones and delete them. However, this is time-consuming.
+
+    - **Approach-2:** Use a min-heap to store keys based on their expiration time. The key with the earliest expiration is at the top. When its timestamp is less than the current time, it gets removed. However, maintaining a min-heap requires significant memory.
+
+    - **Approach-3:** Run a background job periodically that randomly picks a few keys (n keys) and deletes the expired ones. This method is more efficient and avoids the memory overhead of a min-heap.
