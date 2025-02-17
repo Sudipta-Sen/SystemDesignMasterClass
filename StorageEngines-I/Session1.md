@@ -80,6 +80,8 @@ How do we allocate or deallocate memory in C ?? The answer is `malloc`, `calloc`
 
 To track memory usage, every time we call `malloc`, we can also increment a `total_size` variable by the allocated number of bytes (`b`). However, doing this manually for every `malloc` call can be cumbersome. To simplify this, Redis wraps the `malloc` function with a custom function called `zmalloc`, which has the same signature but also handles updating the `total_size` variable internally. This ensures that memory usage is tracked efficiently without adding overhead to every memory allocation operation.
 
+![](Pictures/1.png)
+
 Similarly, Redis uses a `zfree` function to wrap `free`, which updates `total_size` by subtracting the released memory. The details of these functions can be found in Redis's source code (`zmalloc.c` and `zfree.c`). This internal tracking system ensures efficient and accurate memory management in the cache
 
 By using these custom wrappers, Redis efficiently tracks memory usage without the need for expensive system calls, ensuring optimal performance.
@@ -122,24 +124,50 @@ This is the bare minimum, but additional metadata may be needed.
     - Another option is to implemented LRU without a linked list. Here we would need to iterate through each key and find out which was least recently used, which increases the time complexity for eviction.
 
 - Three Considerations for any choice for system design:
-    - Space: Linked list metadata consumes space.
-    - Time: Eviction without metadata is slow.
-    - Correctness: Random eviction risks evicting important keys.
+    - **Space:** Linked list metadata consumes space.
+    - **Time:** Eviction without metadata is slow. (Iterating through all keys)
+    - **Correctness:** Random eviction risks evicting important keys.
 
 - **Optimizing the Second Approach (random eviction):**
 
-    Instead of random eviction, we can improve by sampling a subset of keys and evicting the least recently used (local maximization instead of global). Redis implements this with an eviction pool of 15 elements. This pool contains keys that are good candidates for eviction. When LRU is triggered, Redis removes the least recently used key from the pool until sufficient space is freed. Redis also runs periodic jobs to update the eviction pool by randomly picking keys and keeping the least recently used keys in the pool.
+    Can we improve the 2nd approach without completely relying on randomness? We can, by introducing a sampling strategy while keeping space and time usage manageable. Instead of evicting a totally random key, we can take a sample of keys and evict those that are least recently used (LRU). This way, we're doing local optimization rather than global, focusing on a subset of keys that are good candidates for eviction.
+
+    In this approach, we introduce a fixed space overhead with a **sample + eviction pool**. Redis implements this by maintaining an eviction pool with a fixed size of 15, regardless of the total number of keys. The eviction pool stores keys that are likely to be evicted. When the eviction condition is triggered using the LRU strategy, keys from the eviction pool are removed in sequence until enough memory is freed.
+
+    To keep the eviction pool updated, Redis runs a background job periodically or during idle times. This job picks random keys from the hash table and adds them to the eviction pool, ensuring that the pool always contains the least recently used keys that the system has encountered.
+
+    This approach offers a balance between space, time, and correctness, avoiding the full cost of randomness while still keeping eviction time and memory efficient.
 
 ### Implementing TTL (Time-to-Live) in Cache
 
 **Question:** How can TTL (Time-to-Live) be implemented in cache?
 
-**Answer:** Since we store the value as a struct, we can add a field for the expiration timestamp in the same struct. This timestamp is calculated by adding the current time to the TTL when the key is created or updated. The challenge is identifying expired keys and removing them.
+**Answer:** Since we store the value as a struct, we can add a field for the expiration timestamp in the same struct. This timestamp is calculated by adding the current time to the TTL when the key is created or updated.
+
+```c
+struct {
+    void *val;        // Pointer to the value stored (can be any data type, like string, set, etc.)
+    int type;         // Indicates the type of the value (e.g., int8, hyperloglog, bloom_filter, string)
+    time_t expire_at; // Timestamp indicating when the key will expire
+};
+```
+
+Here hard deletion may seem costly but since everything is stored in RAM, it is not an issue. Hard deletion is costly when the data lies on disk. The main problem here is addressing expired keys that remain in memory but are never accessed. The challenge is identifying expired keys and removing them.
 
 - Approaches for Removing Expired Keys:
 
-    - **Approach-1:** During the eviction job, check all keys to find expired ones and delete them. However, this is time-consuming.
+    - **Approach-1:** When the eviction job runs, as discussed earlier, it will check all the keys, identify the expired ones, and remove them. However, this process is time-consuming and inefficient, as it involves scanning all keys to determine expiration.
 
     - **Approach-2:** Use a min-heap to store keys based on their expiration time. The key with the earliest expiration is at the top. When its timestamp is less than the current time, it gets removed. However, maintaining a min-heap requires significant memory.
 
-    - **Approach-3:** Run a background job periodically that randomly picks a few keys (n keys) and deletes the expired ones. This method is more efficient and avoids the memory overhead of a min-heap.
+    - **Approach-3:** We can run a background job at specified intervals, which randomly selects *n* keys and deletes those that have already expired. The value of n must be chosen carefully—if *n* is too large, the job will take longer to execute; if *n* is too small, the probability of selecting non-expired keys increases because non-expired keys outnumber expired ones. This can result in slower eviction of expired keys, as it becomes more likely to miss them. Balancing *n* is key to optimizing this process. This method avoids the memory overhead of a min-heap. 
+    
+    - **Approach 4:** Similar to sampling, we create a fixed-size priority queue regardless of the number of keys. A background job randomly picks a key, and if it’s expired, the key is deleted. If it’s not expired, the job attempts to insert the key into the min heap, which will hold the most likely keys to expire. While this approach improves upon the previous one, it introduces the overhead of managing the priority queue, making it less efficient. We often avoid this due to the extra complexity.
+    
+    - **Approach 5:** We can implement lazy deletion, where on each GET query, the cache server fetches the value (assuming the key exists), checks whether the key has expired, and if so, deletes it and returns a 404 response. If the key is still valid, it returns the value. The issue with this approach is that expired keys may remain in memory indefinitely, consuming space. If a key is never accessed after its expiration, it will persist forever in RAM.
+
+    To address the limitations of **Approach 5**, we can combine it with either **Approach 3** or **Approach 4**. This combination optimizes the eviction process — **Approach 5** handles the majority of expired keys during read operations, while **Approach 3** or **4** takes care of any remaining expired keys in the background. While the challenges of **Approach 3** or **4** (sampling overhead, managing priority queues) still apply, these methods complement each other well. Given that caches are typically read-heavy, most expired keys will be cleaned up by **Approach 5**, with the remaining handled by the background process.
+
+### Enhancing Cache Performance with Sampling and Probabilistic Theory
+
+We can also improve cache performance using sampling and probabilistic theory. For example, if we sample 20 keys and find 4 that are expired but not yet deleted, this implies that 20% of the sampled keys are expired. We can infer that roughly 20% of the entire cache might also consist of expired keys. When this percentage exceeds a certain threshold, we can trigger a full cleanup job to scan the entire cache and delete all expired keys by doing a stop the world, ensuring optimal memory usage.
