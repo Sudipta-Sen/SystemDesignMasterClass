@@ -2,105 +2,173 @@
 
 ## Problem Overview:
 
-We are tasked with designing a scalable word dictionary that can return the meaning of words via an API call. The dictionary must be contained within a single file, and words/meanings will be updated weekly. The dictionary file will be 1TB in size, containing approximately 170,000 words. The solution needs to be efficient in handling large datasets and offer reasonable response times.
+We will design a scalable word dictionary that can return the meaning of words via an API call. The dictionary must be contained within a single file, and words/meanings will be updated weekly. The dictionary file will be 1TB in size, containing approximately 170,000 words. The solution needs to be efficient in handling large datasets and offer reasonable response times.
 
 - Key Requirements:
     - **Dictionary stored in one file** (1TB size, 170,000 words, no repetitive entries).
-    - **Scalability:** Dictionary needs to scale for large datasets, potentially containing millions of words.
     - **Portability:** The dictionary should be contained within a single file, making it easy to move.
     - **Weekly Updates:** Every week, a changelog containing new words, updates, or deletions will be applied.
+
     - **Efficient Search and Update Operations:** The design should support quick lookup of words and allow updates without significant overhead.
+    - Every week, the dictionary will be updated with a change log that may include:
+        - New words along with their meanings.
+        - Existing words that may receive updated meanings.
+        - Words that may need to be removed from the dictionary.
+    
+    ![](Pictures/1.png)
 
-## Approach 1: Linear Search
+## Alternative Approach by relaxing constraint 
 
-For a GET request with a word like "apple," we would search the file line by line until we find the word, then return the meaning. This approach, however, has a linear time complexity (O(n)), meaning that for a 1TB file, the average case would still require scanning 0.5TB of data. This is not efficient, especially for large files.
-
-## Approach 2: Indexed Search with HashMap
-
-To improve search performance, we can implement an indexed search by maintaining an index of words and their corresponding offsets within the file. This would allow us to perform a lookup using the index, greatly reducing search times.
-
-- Index Structure:
-    - The index will store words and their offsets (starting positions) in the file.
-
-    - We can use a hashmap to store the index in memory for fast lookups.
-
-- Calculating Index Size:
-    - **Word Size:** The average length of an English word is ~4.7 characters (~5 bytes).
-
-    - **Offset Size:** Each offset is an 8-byte integer (64-bit), which can support a file size of 1TB.
-
-    - **Index Entry Size:** Each index entry would take ~13 bytes (5 bytes for the word, 8 bytes for the offset).
-
-    - **Total Index Size:** For 170,000 words, the index size would be ~2.2MB (13 bytes * 170,000 words).
-
-    We can store the index in RAM for fast lookups or persist it on disk to avoid reloading it every time the server starts. Persisting the index also avoids the need to recreate it during startup.
-
-## File Structure: Embedding the Index in the Data File
-
-Since we are constrained to using a single file, we can append the index to the dictionary file itself. Here’s the design:
-
-1. **Header:** The first part of the file contains a fixed-size header with metadata.
-    - First 4 bytes: Length of the index.
-    - Next 4 bytes: Version information.
-    - Last 8 bytes: Reserved for future use
-
-2. **Index:** Immediately after the header, we store the index, which includes words and their offsets.
-
-3. **Data:** The actual dictionary data (words and their meanings) is stored after the index.
-
-- Loading the File:
-    - Step 1: Load the 16-byte header.
-    - Step 2: Read the index length from the first 4 bytes of the header.
-    - Step 3: Load the index into a hashmap in memory.
-    - Step 4: Start the web server to handle API requests.
-
-## Handling Requests:
-
-### GET Requests:
-
-1. The API server first checks if the word exists in the in-memory index.
-2. If the word exists, the server fetches the corresponding offset from the index.
-3. It reads the word’s meaning from the file using the offset and returns it to the user.
-4. If the word does not exist in the index, it returns a 404 Not Found.
-
-### Update requests:
-
-Each week, a changelog will update the dictionary:
-
-- **New Words:** New entries can be appended to the dictionary file, and the index is updated accordingly.
-- **Updated Meanings:** Existing words can be updated by modifying their associated meanings in the file.
-- **Deleted Words:** Words to be deleted are simply removed from the index, though the data in the file remains.
-
-## Alternative Approach: Content-Addressable File System
-
-If the constraint of using a single file were removed, we could use a content-addressable file system, similar to how Git works. Each word would be stored in its own file, with the file name as the key (word) and the content as the value (meaning).
+If the constraint of using a single file were removed, we can consider creating a separate file for each word, where the file name serves as the key, and the file's content contains the corresponding meaning of the word. This is called **content-addressable file system**, similar to how Git works.
 
 Advantages:
-- **Efficient Lookups:** For a GET request, we can directly access the file for the word.
+- **Efficient Lookups:** For a GET request, we can construct the file path using the key, directly read the file, and return the response if the file exists. If the file doesn't exist, we return a 404 error.
+
 - **Easier Updates:** Updating or deleting a word would involve modifying or removing a single file.
 - **Simplicity:** This approach avoids the need for a large index and can scale easily.
 
 Disadvantage:
 - **File Overhead:** Storing individual files for each word would introduce additional overhead in terms of file system management and storage.
 
-## Scalability Considerations: Multiple API Servers
+## Approaches for Optimizing GET Requests: Pros and Cons
 
-- **Multiple API Servers:** For large-scale applications (e.g., Oxford University data), a single API server may not be sufficient to handle all requests. To scale horizontally, we can deploy multiple API servers, each with a copy of the dictionary.
+Since we cannot use a traditional database, we need to design our own. However, instead of creating a fully-fledged database, we'll build one that efficiently solves the specific problem at hand.
 
-- **Data Synchronization:** Since the dictionary is updated only once per week, staleness is not a significant concern. However, we need to ensure that all API servers are synchronized after every update.
+Our word dictionary will be a simple text file, which we'll call `data.dict`. This file will contain entries like words and their meanings.
 
-- **Cost Optimization:** To reduce infrastructure costs, we can use network-attached storage (NAS) or other storage solutions like HDFS or S3. The API servers would query this central storage system to fetch data, which allows for more lightweight servers.
+For example, a typical entry in `data.dict` might look like this:
 
-## Storage-Compute Separation:
-- **Storage:** The dictionary is stored in NAS, HDFS, or S3, which supports file operations such as reading from specific offsets.
+![](Pictures/2.png)
 
-- **Compute:** API servers are lightweight and can scale independently, accessing the dictionary via network calls. This reduces the cost of maintaining large servers.
+What would a GET call look like? For example, if we receive a GET request for the word "apple," our system needs to search the dictionary and return the corresponding definition: "a fruit."
 
-## API Server Workflow:
-1. The API server boots up and loads the header and index from the storage.
+### Approach 1: Linear Search
 
-2. It loads the index into memory.
+For this GET request, we would search the file line by line until we find the word, and then return its meaning. However, this approach has a linear time complexity (O(n)), meaning that for a 1TB file, in the average case, we would still need to scan 0.5TB of data. This is inefficient, especially for large files. Additionally, there’s a risk that the word might appear within the definition (message, meaning) part, making it challenging to distinguish between the key and the value.
 
-3. It starts the web server and begins serving requests.
+### Approach 3: Binary Search
 
-4. For each request, the server checks if the word exists in the index and fetches the meaning from the storage.
+ We can implement binary search in place of linear seach to improve the efficiency of searching for data. While binary search in a file can be challenging, it is possible with careful implementation. Try experimenting with binary search on a file to explore this solution further.
+
+### Approach 3: Indexed Search with HashMap
+
+To improve search performance, we can implement an indexed search by maintaining an index of words and their corresponding offsets within the file. This would allow us to perform a lookup using the index, greatly reducing search times.
+
+- Index Structure:
+    - The index will store words and their offsets (starting positions) in the file.
+
+    - We can use a hashmap to store the index in memory for fast lookups like below,
+
+        ![](Pictures/3.png)
+
+- Calculating Index Size:
+    - **Word Size:** The average length of an English word is ~4.7 characters (~5 bytes).
+
+    - **Offset Size:** Each offset is an 8-byte integer (64-bit), which can support indexing a file size of 1TB.
+
+    - **Index Entry Size:** Each index entry would take ~13 bytes (5 bytes for the word, 8 bytes for the offset).
+
+    - **Total Index Size:** For 170,000 words, the index size would be ~2.2MB (13 bytes * 170,000 words).
+
+    We can the index itself can be kept either in disk or RAM. However, if we don't persist the index on disk, the index would need to be recreated every time we load the dictionary, significantly increasing the startup time of the API server. To avoid this overhead, we can store the index on disk, allowing us to quickly load it into memory and begin serving requests when the server starts.
+
+    Given the constraint that the dictionary must be stored in a single file, the challenge is how to persist the index within the same file as the dictionary itself.
+
+#### File Structure: Embedding the Index in the Data File
+
+- **Marker Based Approach:**
+
+    A potential approach is to append the index to the data file itself and use a marker to identify where the index ends and the actual data (dictionary) begins. However, storing the index after the data would require scanning the entire file to locate the end marker, which would increase loading time. Instead, we can place the index at the beginning of the file, followed by a marker indicating the end of the index. This way, we only need to read the index and skip loading the actual data until needed.
+
+    However, there is a challenge with using markers — if the chosen marker string appears inside a key, it may lead to incorrect identification of the index's end. 
+
+    Also the marker-based approach (even if the marker never appears in a key) requires us to dynamically increase the size of the character array(index) as we progress through the read operation. At each step, we also need to check if the marker has been encountered, which adds overhead and increases the loading time.
+
+- **Fixed Length Header:** 
+    
+    To avoid these issues, instead of relying on a marker, we can store the exact size of the index in the header. This way, we know exactly how many bytes to read to load the entire index. The process would follow this flow:
+    1. Load the header.
+    2. Retrieve the index length from the header.
+    3. Read the index and load it into memory.
+
+    But how do we determine the size of the header? Do we add another header to describe the length of the next one? Absolutely not! The header has a fixed length in all cases, so we know exactly how many bytes to read. We can structure these bytes to contain specific information.
+
+    For example, let's use a 16-byte header. In this 16-byte structure,
+    - First 4 bytes: Length of the index.
+    - Next 4 bytes: Version information.
+    - Last 8 bytes: Reserved for future use
+
+    This makes the header-loading process simple — just read the first 16 bytes.
+
+    The index starts at byte 17, and we can determine where it ends by reading the length of the index from the first 4 bytes of the header. The actual data (dictionary) begins right after the index. By reading the entire header in one system call, we can efficiently load the index into a character array of exactly the required size, improving speed in contrast of marker-based approach where at each step, we need to check if the marker has been encountered.
+
+    When our API server boots up, it performs a well-optimized startup process.
+    - Step 1: Load the 16-byte header.
+    - Step 2: Read the index length from the first 4 bytes of the header.
+    - Step 3: Load the index into a hashmap in memory.
+    - Step 4: Start the web server to handle API requests.
+
+    Now how the API server handles a GET request - 
+
+    1. The API server first checks if the word exists in the in-memory index.
+    2. If the word exists, the server fetches the corresponding offset from the index.
+    3. It reads the word’s meaning from the file using the offset and returns it to the user.
+    4. If the word does not exist in the index, it returns a 404 Not Found.
+
+## API Server Configuration and Handling Read Requests
+
+Given the scale of handling data as large as Oxford University's dictionary, a single API server is insufficient to manage all read requests effectively. In this case, multiple API servers are required.
+
+- Key Considerations:
+    1. Configuration Needs:
+
+        -  Since each API server holds the entire dictionary and serves data from the disk on each request, the server should be equipped with high-speed SSDs for fast data retrieval.
+
+        - To handle the index efficiently and serve requests quickly, each API server requires high RAM capacity to store the index in memory.
+    
+    2. Scaling and Infrastructure Costs:
+
+        - As traffic increases, more API servers will be needed, each containing a full copy of the dictionary. However, this approach leads to high infrastructure costs as every server will need the same storage and computing power.
+
+            ![](Pictures/4.png)
+
+        - To reduce these costs, we can adopt a model where API servers do not store the full dictionary themselves. Instead, we can use **network-attached storage** (NAS) or a similar distributed storage system. In this model, API servers will query the central storage for data.
+
+    3. Staleness and Data Synchronization:
+
+        - One of the primary concerns with having multiple API servers is data synchronization. However, since the dictionary database is updated only once a week as per our prerequisites, the risk of data staleness is minimized. All API servers can operate with the same copy of the data during the week without the need for real-time synchronization, ensuring consistency across the system.
+
+- Moving to a Storage-Compute Separation:
+
+    By separating storage and compute, the dictionary is stored in a centralized network storage, and API servers only query the storage for the required data and does not contains any data within its own disk. This approach allows API server to be lightweight, so we can use low-configuration servers for the API, significantly reducing costs.
+
+    - **Storage:** The dictionary is stored in NAS, HDFS, or S3, which supports file operations such as reading from specific offsets.
+
+    - **Compute:** API servers are lightweight and can scale independently, accessing the dictionary via network calls. This reduces the cost of maintaining large servers.
+    
+    ![](Pictures/5.png)
+
+    - Storage Requirements:
+
+        - The storage system should support file access over the network.
+        
+        - It should have **key-value** semantics and support operations like reading specific **offsets** and fetching data in **byte ranges**.
+
+        Systems such as NAS, HDFS, and S3 (with byte-range fetch capabilities) are ideal for this setup.
+    
+    - Benefits of Storage-Compute Separation:
+
+        1. **Independent Scaling:** Compute nodes (API servers) can scale horizontally based on traffic without duplicating storage. All servers refer to the same centralized storage, which can also scale independently if needed.
+
+        2. **Cost Efficiency:** While there is a network call involved in accessing data, the cost savings from using lightweight servers and centralized storage are substantial. Furthermore, this ensures all API servers have a **consistent view of the data**.
+    
+    This architecture ensures the system can handle high traffic efficiently while keeping infrastructure costs under control
+
+    - So the API Server Workflow becomes:
+
+        1. The API server boots up and loads the header and index from the storage.
+        2. API server loads the index into memory its own memory.
+        3. It starts the web server and begins serving requests.
+        4. For each request, the server checks if the word exists in the index. 
+            - If the word is not found in the index, it returns a 404 error. 
+            - Otherwise the server retrieves the corresponding byte location from the index, reads the meaning from that position from network storage and sends it back to the user.
