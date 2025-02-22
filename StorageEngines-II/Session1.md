@@ -172,3 +172,77 @@ Given the scale of handling data as large as Oxford University's dictionary, a s
         4. For each request, the server checks if the word exists in the index. 
             - If the word is not found in the index, it returns a 404 error. 
             - Otherwise the server retrieves the corresponding byte location from the index, reads the meaning from that position from network storage and sends it back to the user.
+
+## Handling Updates and Writes in a Dictionary API
+
+Now that we have sorted out the read operations for our API server, let’s shift focus to write operations, specifically handling weekly updates. As illustrated in Pic-6, we have a data.dict file representing the current dictionary, while the changelog contains updated meanings for existing words, as well as new words and their meanings. 
+
+### Challenges in Updating an Entry:
+
+Let's explore the challenges involved in updating a word, say "ball."
+
+1. **Space Management for Updates:**
+
+    Suppose the updated meaning for "ball" requires 10 more bytes than the existing entry. To accommodate the new meaning by overwriting the old one, we would need to right-shift every byte after the modified key by 10B to create space. The complexity of this operation is high because, in the worst case, it might involve shifting all the bytes in the dictionary, which could be up to 1TB in size. On average, we might shift 0.5TB per word. If the changelog contains 100 words, this could result in 50TB of disk I/O—a significant cost in performance. After each update, we would also need to update the index to reflect the new positions.
+
+    Overwriting the new meaning without shifting might overwrite parts of the next word, and unlike memory (RAM), where inserting data is straightforward, we can't easily do the same on disk.
+
+2. **Insertion of New Words:** 
+    
+    For new entries, we would need to shift bytes after the insertion point, similarly creating inefficiency.
+
+3. **Index Updates:**
+
+    After such operations, we would also need to update the index to reflect new positions.
+    
+
+### Improvement with Merge Sort:
+
+Instead of right-shifting, a more efficient approach is to use merge sort:
+
+- Both `data.dict` and the changelog are sorted, allowing us to merge them into a new `data.dict` file.
+
+- The time complexity is `O(n+m)`, where `n` is the number of entries in `data.dict` and `m` is the number of entries in the changelog.
+
+- This approach processes the entire dictionary only once, regardless of how many updates are in the changelog, which drastically reduces the data movement compared to shifting bytes. In the previous approach the same operation is performed for each entry in change log.
+
+- How does merging work?
+
+    We use a two-pointer approach. If both the dictionary and changelog contain a particular key, we take the updated entry from the changelog; otherwise, we take whichever file has the relevant data.
+
+### **Weekly Update Process:**
+    
+Suppose this merging happens every Sunday. The process would be as follows:
+1. Spin up a weekly update server.
+2. Fetch the changelog.
+3. Download the actual dictionary file.
+4. Perform the merge operation.
+5. Upload the latest dictionary file to the database and delete the older version.
+
+### **Handling Index and API Server Synchronization:**
+
+When the new dictionary is uploaded, the index of the unchanged words might change due to updates. The API server needs to reload the new index to ensure it's serving accurate data.
+
+- **Pull-based Approach:**
+
+    The API server checks the current version of the file in storage and compares it to the version in the header it has. If there’s a mismatch, it reloads the index. However, polling too frequently wastes bandwidth, and polling too infrequently might lead to serving stale data for a longer time. The only way to avoid this issue is by replacing the old dictionary file with the new one, rather than using a new name.
+    
+- **Push-based Approach:**
+        
+    The update server pushes notifications to API servers. However, some servers may receive the update while others might not due to failures. To avoid this, a new file name can be used. Servers that get the update will read from the new file, while others will continue reading from the old one. However, the challenge is how the servers reading the old file will eventually switch. To address this, we could think of using a pub/sub model, but that increases infrastructure costs significantly for just a weekly update.
+    
+    - **The Solution - Meta.json File:**
+
+        Instead of complex mechanisms, we can use a meta.json file that contains the S3 path of the latest dictionary file. When a new API server spins up, it reads the meta.json file to get the S3 path, loads the index, and starts serving requests. For older servers, we can use a rolling update process. After the weekly update server finishes uploading the new dictionary and updating the meta.json file, it triggers a Jenkins deployment. This deployment deletes old API servers and spins up new ones, which automatically read the latest file.
+    
+### Storage and Compute Separation:
+
+Here, we've built a system that can efficiently query data stored in S3 with a pointed read operation—given a word, it returns the meaning. This system can be useful for key-value pairs that are infrequently accessed, whereas frequently accessed data might reside in a system like DynamoDB. For example, recent Amazon orders might be stored in DynamoDB, while older orders (3+ months) could be stored in S3, reducing infrastructure costs.
+
+## Handling Deletions in Changelog:
+        
+The changelog can also contain deletion markers. We can use markers like 1 for new words, 2 for updated words, and 3 for deleted words. While merging, any word with a 3 marker will be skipped, effectively removing it from the new dictionary.
+
+This approach optimizes the update process while keeping the API servers in sync with the latest data efficiently and cost-effectively.
+
+
