@@ -193,4 +193,6 @@ For each record stored on disk (which includes the key, value size, actual key, 
 
     ![](Pictures/20.png)
 
+![](Pictures/21.png)
+
 This approach resembles the **Bitcask** database model, one of the fastest embedded databases used in production systems like Uber.
