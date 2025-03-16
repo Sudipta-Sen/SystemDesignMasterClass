@@ -13,14 +13,16 @@ With this in mind, the goal is to provide a fast and seamless user experience, w
 
 ## Current Search Flow
 
-The search functionality was powered by Elasticsearch. Users had an endpoint /search, and upon making a request, the system passed parameters to the Search Microservice. This microservice would:
+The search functionality was powered by Elasticsearch. Users had an endpoint `/search`, and upon making a request, the system passed parameters to the Search Microservice. This microservice would:
 
 1. Construct an Elasticsearch query.
 2. Fire the query to the Elasticsearch cluster.
 3. Retrieve and return the response.
 
 ## Designing Recent Searches
-To introduce recent searches, we will create another endpoint, /search/recent. When a user hits this endpoint, the search service will fetch the last 10 searches they made and return the result.
+To introduce recent searches, we will create another endpoint, `/search/recent`. When a user hits this endpoint, the search service will fetch the last 10 searches they made and return the result.
+
+![](Pictures/1.png)
 
 There are two options for fetching the recent searches:
 
@@ -30,6 +32,7 @@ There are two options for fetching the recent searches:
 - Pros:
     - Accurate results with up-to-date searches.
     - No need for additional storage.
+    - The data provided will always be up-to-date, ensuring no stale information is delivered.
 
 - Cons:
     - Slower response times since it queries the database each time.
@@ -45,62 +48,70 @@ There are two options for fetching the recent searches:
     - Requires additional storage to hold precomputed data.
     - Data may be slightly stale (but for recent searches, this is usually acceptable).
 
-This presents a classic **compute vs. storage** tradeoff. In scenarios where real-time accuracy is critical (e.g., financial transactions), we’d opt for **on-the-fly** computation. But in this case, **precomputed** data is sufficient, since:
-- Users are unlikely to notice small inaccuracies in recent search results.
-- The search bar is the first interaction point for most users (50% within 5 seconds of login), and it should be fast.
+### Precomputed Data vs On-the-Fly Computation: Balancing Accuracy, Performance, and Cost
+
+This example illustrates the classic **compute vs. storage** tradeoff. When we choose to compute data on the fly, we prioritize compute resources over storage. Since compute is generally more expensive than storage, we need to consider whether real-time accuracy is essential. 
+- If we require highly accurate data at any given moment—such as in financial transactions — we would opt for **on-the-fly** computation. However, if slight staleness in the data is acceptable, choosing storage can significantly reduce infrastructure costs.
+
+- In our case, we can tolerate a small amount of staleness since we’re not dealing with critical data. For example, the user may not even remember their exact last 10 searches, nor does the order matter much. In fact, if a user logs in after a long period, like a year, retrieving the exact data would be costly and may not add much value.
+
+- From a **product perspective**, user behavior indicates that 50% of users tap on the search bar within five seconds of logging in, making it the **first interaction point with the app** which can't be slow. To keep this interaction fast, precomputed data is preferable as it provides quicker responses than computing on the fly.
 
 ## Storage and Access Pattern
-We need a fast-access database to store and retrieve precomputed recent searches. The access pattern is simple: **Given a user ID**, return their last 10 search queries.
+To support precomputed data, we need a fast-access database to store and retrieve precomputed recent searches. The access pattern is simple: **Given a user ID**, return their last 10 search queries. So a key-value store works well for this use case.
 
-### **Estimating Storage:**
+### Estimating Storage:
 - Each user has 10 recent searches.
 - Assume each search query is 16 characters long.
 - If there are 1 million users, the storage required would be:
     - 16 * 10 * 1,000,000 = 160MB
 
-A **single node** is sufficient for storing this data, but not for handling the query load. With 1M users querying the platform, the database needs to scale to handle the load. Therefore, we should choose a database that supports sharding and partitioning, such as Redis, DynamoDB, or MySQL.
+A **single node** is sufficient for storing this data, but not for handling the query load. With 1M users querying the platform, the database needs to scale to handle the load. 
 
-### **Why Redis?**
+We have two choices for managing data distribution: **replication** or **sharding**. 
+- With **replication**, we risk data staleness because copies of data might not be perfectly synchronized. 
+- On the other hand, with **sharding and partitioning** (partitioning by user ID), we can ensure data is more up-to-date and scale effectively. Since our use case prioritizes real-time access without staleness, we are opting for sharding, where each partition handles a specific subset of data, ensuring faster and more reliable access.
+
+Therefore, we should choose a database that supports sharding and partitioning, such as Redis, DynamoDB, or MySQL.
+
+### Choosing the Right Database
+
 Redis is optimal for storing precomputed data because:
 
-- Fast access: Redis operates in-memory, providing low-latency data retrieval.
-- Cost-efficient: In our case, Redis only needs to store 160MB, which is relatively inexpensive.
+- It is the **fastest**, but since it stores data in memory, it can be costly. After running some calculations earlier, we determined that we only need **160MB** of memory in Redis, which is affordable. Therefore, we'll use Redis to store our precomputed data for fast retrieval.
 
-However, Redis is in-memory and does not persist data if it crashes. But since the data is not critical and can be recomputed, this is acceptable.
+However, Redis has one downside: 
 
-## Persistent Storage for Analytics
+- Since it's in-memory, it loses data on failure. The question is, **is this data mission-critical?** The answer is no—we can afford to lose precomputed data and simply recompute it if needed. So, we will use Redis as our sole storage for precomputed data without worrying about backing it up elsewhere.
 
-While Redis serves as a fast-access store for recent searches, we also need to persist the search data for analytics purposes. Many teams, such as those in analytics, recommendations, and ads, can use this data to:
+- **From a business perspective**, though, there may be a need for more permanent storage. Analytics teams could benefit from this search data by
+    - Understanding user behavior 
+    - create personalized recommendations and ads (e.g., Instagram reels or targeted ads based on recent searches). 
+    
+    Therefore, we should also **store these search queries in a persistent database for long-term analytics and insights**.
 
-- Understand user behavior.
-- Provide personalized recommendations (e.g., Instagram reels or targeted ads).
+    ![](Pictures/2.png)
 
 ### What to Store?
-We can store either:
+Should we store only the 10 most recent searches or all the queries made by a user? This brings up the concept of bounded and unbounded data.
 
 1. **Bounded data:** Storing a fixed number of searches (e.g., 10 recent searches).
     - This is a bounded data problem where we know the size and can use an array or similar structure.
 
 2. **Unbounded data:** Storing all searches made by a user.
-    - This requires flattening the data across multiple records. Each query can be stored as a document (e.g., in MongoDB or Elasticsearch).
+    -  The data size can grow indefinitely. In this case, using an array or single object isn’t suitable. Instead, we flatten the data across multiple files or documents. For instance, each search query can be stored as a separate MongoDB document or row in an SQL database, preventing any single document from becoming too large.
 
-For unbounded data, we can store:
+For unbounded data, we will store each search query made by every user as a single document. This will include
 
 - User ID
 - Search query
 - Timestamp
 - Geo-location
 
-We should choose a JSON-based DB like DynamoDB, Elasticsearch, or MongoDB to store this semi-structured data.
+To manage this flexible and semi-structured data, a JSON-based database such as **DynamoDB**, **Elasticsearch**, or **MongoDB** is appropriate, as it can easily handle the growing or shrinking number of attributes.
 
 ## Data Ingestion: Synchronous vs. Asynchronous Writes
-We have two ways to get search data into persistent storage:
-
-### Synchronous Writes:
-1. The search service directly writes data to the database during each search.
-2. **Challenges:**
-    - Increases latency (search won’t return until data is written).
-    - Adds pressure on the database due to frequent writes.
+How do we ensure our search data reaches persistent storage? We have two ways to get search data into persistent storage:
 
 ### Asynchronous Writes:
 
@@ -113,28 +124,82 @@ We have two ways to get search data into persistent storage:
 
 Asynchronous writes are preferred for this use case since it reduces latency and minimizes the load on the database.
 
-## Choosing the Persistent Database
-We need a database that provides:
+### Synchronous Writes:
+1. The search service directly writes data to the database during each search.
+2. **Challenges:**
+    - Increases latency (search won’t return until data is written).
+    - Adds pressure on the database due to frequent writes.
 
-1. Durability
-2. High data ingestion rate
-3. Partitioning and sharding support
-4. JSON structure storage
-5. Geo-spatial search capabilities
-6. Text-based search features (lemmatization, stemming)
+In the synchronous approach, each time a user searches, we execute one read and two write operations:
+
+1. **Read** from the Elasticsearch (ES) cluster to retrieve the search results.
+2. **Write** to update the recent searches in Redis.
+3. **Write** to the persistent database to store the search query.
+4. **Return** the results of the first query.
+
+In the **happy path**, the order of these operations (1, 2, 3) doesn’t matter since the result is only returned when all operations succeed. But in case of failure, the order becomes important. This is where the **product experience** comes into play and the final decission is taken care by the product team not by the engineering team. 
+
+### Adding Fields for Business Insights
+
+When logging to persistent storage, we already have the query result. To enable future insights, we can store additional metadata parameters, such as `len(result)`, to gather analytics. This can help identify search queries that return no results, indicating potential gaps in our offerings.
+
+By tracking search queries that return no or few results, we can quickly recognize what users are looking for that we currently don’t offer. For example, if a large number of users search for a specific topic or product that isn't available, it signals an opportunity to introduce new features, services, or products to meet customer demand. This insight can drive the expansion of offerings, as was the case at Unacademy, Arpit’s experience showed how capturing these insights helped the company recognize topics users were interested in but that weren’t yet covered by their platform. They then introduced new sections based on this data, driving business growth.
+
+**Conclusion:** Storing search data is crucial not only for improving user experience but also for **analytics, fraud detection, and uncovering new revenue opportunities**. This is why thoughtful design, beyond coding, is essential to driving business impact.
+
+## Cost Optimization in the Current Architecture
+
+Till now our architecture look like below -- 
+
+![](Pictures/3.png)
+
+Are there opportunities to reduce costs while maintaining performance?
+
+1. **Optimizing Storage for Storing Search Queries:**
+
+    - **Compression Considerations:** While data compression could save space, it is more effective for large files. Since each search query is stored as an individual file (small size), compression will not yield significant benefits.
+
+    - **Archiving Old Data:** We don't need to store every search query from all users indefinitely. To optimize storage, we can implement a time threshold — after which older search data can be archived and moved to a more cost-effective storage solution like Amazon S3. 
+    
+        This aligns with our previously discussed approach of hot, warm, and cold storage, data staging, and the use of data lakes, pipelines, and frameworks like Apache Hudi and Spark Streaming. These will help manage and streamline the flow of data while keeping storage costs low without compromising future data access or analytics.
+
+2. **Cost Savings in Redis:**
+
+    - **Combining Redis with Persistent Storage:** While we could theoretically eliminate Redis and store everything in persistent storage (e.g., DynamoDB, MongoDB), this would increase latency for retrieving the 10 most recent searches. Additionally, databases like DynamoDB mainly charge based on each query, which could lead to higher costs due to frequent access to recent searches.
+
+    - **Redis as a Cost-Effective Solution:** Redis is optimized for fast access and in-memory data storage, and in our case, it only requires 160MB of RAM. Redis billing is based on infrastructure, allowing unlimited queries at no extra cost, making it more cost-efficient than frequent queries to persistent storage systems. Therefore, **Redis remains the best option** for our use case, providing both speed and cost efficiency.
+
+## Synchronous vs Asynchronous Writes: Storing Queries in Persistence DB
+
+We can adjust our architecture by introducing asynchronous writes through Kafka. Instead of directly writing search queries to the persistent storage, we can publish them to Kafka, and a separate broker will consume the data and write it to the persistent storage.
+
+![](Pictures/4.png)
+
+So, what should we prefer—synchronous or asynchronous writes?
+
+1. **Performance:** Synchronous writes take longer compared to asynchronous. With synchronous writes, the search latency increases because the user receives a response only after the DB write completes. In contrast, Kafka operates as an append-only system with higher throughput, whereas a traditional database also handles indexing, B+ tree rebalancing, and other operations, which consume more time.
+
+2. **Load on the Database:** Synchronous writes put more pressure on the database with micro-writes, as each user query leads to an individual write. With asynchronous writes, we can batch multiple queries at the broker and write them to the DB in bulk. If there are 1M users on the platform, synchronous writes would lead to an equivalent number of DB operations, whereas asynchronous writes significantly reduce this load.
+
+3. **Scalability and Flexibility:** With asynchronous writes, we can introduce multiple brokers for different tasks like analytics or other processing needs. This approach allows the system to scale more efficiently.
+
+Asynchronous writes, therefore, offer better performance, reduce DB load, and increase flexibility, making them the more sensible choice for this use case.
+
+## Choosing the Persistent Database
+
+When deciding between DynamoDB, Elasticsearch, and MongoDB for storing search queries, we need to consider several factors based on our use case. Here’s what we require from the persistence DB:
+
+1. **Durability**
+2. **High data ingestion rate:** The ability to handle a large volume of writes efficiently.
+
+3. **Partitioning and sharding support**
+4. **JSON structure storage:** As the data is semi-structured, we need a database that supports JSON storage.
+5. **Medium Read/Write Throughput:** We don’t need extremely high throughput, but it must be capable of handling regular queries and writes.
+6. **Geo-spatial search capabilities:** We need to perform geospatial searches (DynamoDB lacks this feature).
+7. **Support for Range Queries:** Range-based queries help businesses analyze search trends over time, identifying rising interests, seasonal trends, or declining topics which can influence product offerings or marketing strategies.
+8. **Text-Based Search and Analysis:** When the analytics team works on personalization, ads, or recommendations, they need advanced text search features. This includes tasks like stemming, lemmatization, typo correction, and synonym matching, as user queries often contain variations. A database with powerful text search capabilities is essential.
 
 Based on these requirements, **Elasticsearch** is the best fit. It supports text search, analytics, geo-search, and provides partitioning/sharding, making it ideal for both real-time searches and analytics.
-
-## Optimizing for Cost
-
-### Reducing Storage Costs:
-1. **Compression:** Not effective here as individual search queries are small.
-2. **Archiving:** After a certain period, older search queries can be moved to cheaper storage like Amazon S3. This fits well with the concept of hot, warm, and cold storage, where:
-    - **Hot storage** (like Redis) holds frequently accessed recent searches.
-    - **Warm storage** (like Elasticsearch) holds all user searches.
-    - **Cold storage** (like S3) holds older, less frequently accessed data.
-### Reducing Redis Costs:
-Combining Redis with persistent storage could increase latency due to slower access times from disk-based databases like DynamoDB or MongoDB. Since Redis is inexpensive for our use case (160MB of data), it remains the most cost-effective solution.
 
 ## Conclusion
 To build a robust recent search feature:
