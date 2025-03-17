@@ -199,7 +199,15 @@ When deciding between DynamoDB, Elasticsearch, and MongoDB for storing search qu
 7. **Support for Range Queries:** Range-based queries help businesses analyze search trends over time, identifying rising interests, seasonal trends, or declining topics which can influence product offerings or marketing strategies.
 8. **Text-Based Search and Analysis:** When the analytics team works on personalization, ads, or recommendations, they need advanced text search features. This includes tasks like stemming, lemmatization, typo correction, and synonym matching, as user queries often contain variations. A database with powerful text search capabilities is essential.
 
+**Analysis:**
+
+- **DynamoDB** lacks geospatial search and advanced text search capabilities, so it’s not suitable.
+- **MongoDB** doesn’t offer the full range of advanced text filtering and analysis features we require, like streaming and lemmatization for exploratory analysis.
+- **Elasticsearch** stands out as it supports text-based filtering, geo-search, and complex analysis for internal business use cases.
+
 Based on these requirements, **Elasticsearch** is the best fit. It supports text search, analytics, geo-search, and provides partitioning/sharding, making it ideal for both real-time searches and analytics.
+
+We will use two **Elasticsearch** clusters: one dedicated to search results for user queries and another stroring user search queries for internal business and analytics purposes, ensuring optimal performance for both external users and internal teams.
 
 ## Conclusion
 To build a robust recent search feature:
