@@ -266,7 +266,7 @@ When multiple pullers are working in parallel to fetch scheduled tasks from the 
 
 - **Final Takeway:**
 
-    To ensure **at-least-once execution** and maintain system reliability without recovery overhead. So we will take take the first approach - **Put into Queue Before Updating `picked_at`**. The steps are -- 
+    To ensure **at-least-once execution** and maintain system reliability without recovery overhead. So we will take the first approach - **Put into Queue Before Updating `picked_at`**. The steps are -- 
 
     - Push the task into the queue first.
 
@@ -337,3 +337,133 @@ The Distributed Task Scheduler (DTS) is a **highly scalable** and **fault-tolera
 
 
 
+## Improving the Job Table for Better Observability
+
+To improve observability, we need to enhance our current jobs table to track detailed execution lifecycle events. Here are the proposed enhancements:
+
+a. **`completed_at` Timestamp**
+
+- **Purpose:** To track when the HTTP call (i.e., the job execution) completes.
+
+- **Implementation:** Executors push job completion events into a message broker (e.g., Kafka or SQS). Dedicated consumers then consume these events and write them to the database.
+
+- **Benefits:** This decouples job execution from DB writes and improves system throughput.
+
+- **Caution:** Ensure minimal delay between job completion and DB update. Delays could result in poor user experience as clients rely on this info.
+
+- **Optimization:** Consider batch writes to reduce DB load with a defined maximum delay.
+
+b. **Response Storage**
+
+- Add a `response` column that includes HTTP response body and status code.
+
+- **Purpose:** Helps diagnose why a task failed or succeeded.
+
+- **Benefit:** Improves transparency and debugging.
+
+c. **SLA Compliance Column**
+
+- Add a `sla_met` column (YES/NO).
+- **Why:** While `completed_at - scheduled_at` gives SLA info, clients shouldn’t calculate this manually.
+
+- **Benefit:** Makes it easier for customers and system operators to quickly assess SLA compliance.
+
+d. **Identifying SLA Breach Points**
+
+- **Cause 1: Puller Delay:** Compare `scheduled_at` and `picked_at` timestamps.
+
+- **Cause 2: Queue Delay:** Add a new started_at column.
+    - `picked_at` → when puller picked the task
+
+    - `started_at` → when executor started the HTTP call
+
+    - `completed_at` → when the HTTP call completed
+
+    - Differences between these give insights into queue delays and HTTP latency.
+
+## Handling Retries
+
+Retries can lead to SLA breaches, especially if retries are queued behind many new tasks.
+
+**Retry Visibility:**
+
+- **New Column:** Add a retry_count to show how many retries were needed.
+- **Failure Tracking:** Store failure reasons/responses from each failed attempt.
+
+- **Approaches:**
+    1. **New Job ID per Retry:**
+
+        - Create a new entry in `jobs` table with a new job ID.
+        - Maintain `parent_job_id` to link retries. 
+    
+    2. **Looped Retries within Same Job:**
+        - Retry within the same job entry.
+        - Configurable retry attempts (set by customer).
+
+##  Puller Query & Performance Tuning
+
+Why Limit in SQL Query is Needed:
+
+- Without LIMIT, one puller can lock 10K tasks.
+
+- Prevents load balancing among multiple pullers.
+
+- Can lead to SLA violations.
+
+Optimizing Puller Count:
+
+- Use task processing time and queue size for dynamic scaling.
+- Example Calculation:
+
+    - 10K tasks, 15ms per task
+    - Limit = 2, Pullers = 10
+    - Total time = (10,000 * 15ms) / (2 * 10) = 7.5s
+- Orchestrator can use this to decide how many pullers are needed.
+
+## Support for Recurring Jobs
+
+Recurring jobs (e.g., daily 10 AM execution) need a robust system to track executions and plan future ones.
+
+**Problem with One Table Design:**
+
+- Adding recurring logic in the same jobs table complicates schema.
+- Makes updates/deletes for future jobs cumbersome.
+
+**Solution:** Split into `tasks` and `jobs` Tables
+
+**Tasks Table (Like a Program):**
+
+- Fields: `task_id`, `tenant_id`, `cron_schedule`, `scheduled_at`
+- Represents a high-level user-defined task
+
+**Jobs Table (Like a Process):**
+
+- Fields: `job_id`, `task_id` (FK), `scheduled_at`, `started_at`, `picked_at`, `completed_at`, `status`, `response`, `sla_met`, `retry_count`
+
+- Represents each execution of a task
+
+Benefits:
+
+- Easier updates/deletes for recurring tasks
+
+- Clean separation of scheduling vs. execution
+
+## Future Job Scheduling for Recurring Tasks
+
+When a recurring task is submitted:
+
+- Pre-create 5-10 future job entries
+
+- Executor checks if it's a recurring job during execution
+
+- If yes, it creates the next future occurrence (ensures future jobs always exist)
+
+- Use `cron_schedule` from tasks table to generate the next `scheduled_at`
+
+## Multi-Tenant and Rate-Limited Pullers
+
+To support tenants with different throughput requirements:
+
+- Pullers should be tenant-aware
+- This allows rate limiting, throttling, and dedicated infra per tenant
+- Improves SLA adherence for high-priority customers
