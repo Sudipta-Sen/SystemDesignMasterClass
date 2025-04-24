@@ -141,8 +141,6 @@ This introduces a new problem: how do we ensure that multiple pullers assigned t
 2. Execution remains parallel for efficiency.
 3. Job selection and update happen atomically.
 
-
-
 We store job-related tasks in a jobs table with the following structure:
 1. id: Primary Key
 2. tenant_id
@@ -332,75 +330,155 @@ To improve scalability and efficiency, we can introduce multiple message brokers
 
     Based on this data, the orchestrator can dynamically scale the number of executor instances assigned to each queue to **minimize task wait time and meet SLA requirements.**
 
-## Summary
-The Distributed Task Scheduler (DTS) is a **highly scalable** and **fault-tolerant** system designed to schedule and trigger millions of tasks (HTTP API calls) daily with minute-level granularity. By partitioning tasks based on tenants, leveraging **Zookeeper** for configuration management, and **using multiple pullers and executors**, the system ensures reliable execution of tasks within defined SLAs.
-
-
 
 ## Improving the Job Table for Better Observability
 
-To improve observability, we need to enhance our current jobs table to track detailed execution lifecycle events. Here are the proposed enhancements:
+To improve observability, we need to enhance our current jobs table to track detailed execution lifecycle events. The current job table looks like below -- 
 
-a. **`completed_at` Timestamp**
+![](Pictures/7.png)
 
-- **Purpose:** To track when the HTTP call (i.e., the job execution) completes.
+Here are the proposed enhancements:
 
-- **Implementation:** Executors push job completion events into a message broker (e.g., Kafka or SQS). Dedicated consumers then consume these events and write them to the database.
+✅ **`completed_at` Timestamp**
 
-- **Benefits:** This decouples job execution from DB writes and improves system throughput.
+- **Purpose:**
 
-- **Caution:** Ensure minimal delay between job completion and DB update. Delays could result in poor user experience as clients rely on this info.
+    Currently there is no information about job completion time — i.e., when the HTTP call initiated by the executor finishes execution.
 
-- **Optimization:** Consider batch writes to reduce DB load with a defined maximum delay.
+    Without capturing the completion time:
 
-b. **Response Storage**
+    - We lose insight into actual job duration.
+    - It's harder to troubleshoot delays or failures.
+    - Most importantly, customers may not see updated statuses, leading them to believe their tasks were never executed.
 
-- Add a `response` column that includes HTTP response body and status code.
+    To address this, we must **introduce a** `completed_at` **timestamp column* in the jobs table**, which marks the exact time when a job finishes.
 
-- **Purpose:** Helps diagnose why a task failed or succeeded.
+- **How to populate `completed_at`**:
 
-- **Benefit:** Improves transparency and debugging.
+    Once the job completes (i.e., the HTTP call finishes), the executor needs to write job completion info, including status and completion time, to the database. But should this be done synchronously or asynchronously?
 
-c. **SLA Compliance Column**
+    Writing synchronously would block the executor and increase response latency—especially under high load.
 
-- Add a `sla_met` column (YES/NO).
-- **Why:** While `completed_at - scheduled_at` gives SLA info, clients shouldn’t calculate this manually.
+    - Asynchronous Approach Using a Message Broker
 
-- **Benefit:** Makes it easier for customers and system operators to quickly assess SLA compliance.
+        Instead, we adopt an **asynchronous design** using a message broker like **Kafka** or **SQS**:
 
-d. **Identifying SLA Breach Points**
+        - Executors push completion metadata (including **completed_at**, **HTTP status**, **response body**, etc.) into a Kafka topic.
 
-- **Cause 1: Puller Delay:** Compare `scheduled_at` and `picked_at` timestamps.
+        - A pool of consumers reads messages from this topic and performs database writes.
 
-- **Cause 2: Queue Delay:** Add a new started_at column.
-    - `picked_at` → when puller picked the task
+    This decouples job execution from database operations and provides scalability and resilience.
 
-    - `started_at` → when executor started the HTTP call
+    **Batching writes** from consumers to the DB helps reduce load. However, we must ensure that the **status is updated within a bounded time window** to maintain a real-time experience for users.
 
-    - `completed_at` → when the HTTP call completed
+🌐 **HTTP Response Storage**
 
-    - Differences between these give insights into queue delays and HTTP latency.
+- While the `completed_at` column records the exact timestamp when a job finishes, observability can be further improved by capturing the full context of the HTTP call associated with each job.
+
+- We can store the HTTP status code in a generic `status` column. However, for deeper debugging and operational insights, we can capture the **HTTP response body** along with the **status code**.
+
+🕒 **SLA Compliance Tracking**
+
+- **Purpose:**
+
+    From a user’s perspective, knowing whether their job has met the expected SLA is critical. While we already store `scheduled_at` and `completed_at` timestamps in our job table, relying on users to **manually compute the time difference** to assess SLA compliance is neither user-friendly nor scalable.
+
+    Expecting users to subtract timestamps for each job to understand SLA adherence is not empathetic design. As platform engineers, we must abstract this complexity away and proactively surface SLA insights.
+
+- **Solution:**
+
+    To provide clear, actionable observability, we can add a new Boolean column — `sla_met` — that explicitly tells whether a job met its SLA (`YES` or `NO`). This provides immediate clarity and reduces the cognitive load on users.
+
+    Furthermore, this column helps us **internally analyze SLA violations** and identify bottlenecks in the system.
+
+    Furthermore, this column helps us internally analyze SLA violations and identify bottlenecks in the system.
+
+🔍 **Diagnosing SLA Breaches — Understanding Choke Points:**
+
+There are multiple internal stages where delays may occur. By analyzing additional timestamps in our system, we can isolate the root cause:
+
+1. Puller Delay
+    - **Cause:** The puller picked up the task significantly later than it was scheduled.
+    - **Diagnosis:** Compare `scheduled_at` vs. `picked_at`. A large gap indicates puller lag.
+
+2. Queueing Delay Between Puller and Executor
+
+    - Cause: After being picked, the task waited too long before actual execution started.
+
+    - Diagnosis: Ideally, we should compare `picked_at` vs. `started_at` (the moment the HTTP request was made by the executor). Currently, we have `picked_at` and `completed_at` but difference between them includes both the queue waiting time and the HTTP response time.
+
+        Note: If we don’t currently store `started_at`, this is a good reason to introduce it for better observability.
+
+3. Slow or Failed Downstream HTTP Calls
+
+    - **Challenge:** Even if we are prompt, the downstream service might timeout or respond slowly.
+    - **Case:** SLA is 30 seconds, but the HTTP call times out after 40 seconds.
+In this case, although the SLA is breached, it's not our system's fault.
+    - **Solution:** Introducing a `started_at` timestamp allows us to distinguish between our system delay and third-party latency.
+
+    - **Bonus Insight:** With `started_at` and `completed_at`, we can calculate the **exact duration of the HTTP call**.
+
+    By capturing and analyzing these timestamps, we can build a **transparent, empathetic, and diagnosable** system where both customers and internal teams gain clarity on where and why an SLA might have been breached.
+
+📊 Fields for SLA & Observability:
+
+| Column Name    | Description|
+|----------------|------------|
+| `scheduled_at` | Timestamp when the job was suppose to be executed |
+| `picked_at`    | Timestamp when the job was picked by the puller | 
+| `started_at`   | Timestamp when the executor started the HTTP call | 
+| `completed_at` | Timestamp when the HTTP call finished (success or failure) |
+| `status`       | HTTP status code returned by the API  |
+| `response`     | HTTP response body returned from the API |
+
+![](Pictures/8.png)
 
 ## Handling Retries
 
-Retries can lead to SLA breaches, especially if retries are queued behind many new tasks.
+- **Need**
 
-**Retry Visibility:**
+    In any task execution system, failures can occur due to reasons like network issues, server timeouts, or downstream system errors. A robust retry mechanism is essential to improve reliability. However, without visibility into these retries, users are left in the dark — they can’t know if a task failed initially or how many attempts it took to eventually succeed.
 
-- **New Column:** Add a retry_count to show how many retries were needed.
-- **Failure Tracking:** Store failure reasons/responses from each failed attempt.
+    From a customer experience standpoint, this lack of transparency is concerning. For instance, if a HTTP call failed multiple times and succeeded only after several retries, it may still breach the user’s SLA expectations. Moreover, in the current table design, retry attempts are not reflected at all, which limits observability and prevents debugging.
 
-- **Approaches:**
-    1. **New Job ID per Retry:**
+- **Solution**
 
-        - Create a new entry in `jobs` table with a new job ID.
-        - Maintain `parent_job_id` to link retries. 
+    To address this gap, we must enhance our system to track and expose retry information both for internal diagnostics and user transparency. Here's how we can approach it:
+
+    1. **Track Retry Attempts**
+        - Add a new column called `retry_count` in the `jobs` table to track how many times a job has been retried before succeeding.
     
-    2. **Looped Retries within Same Job:**
-        - Retry within the same job entry.
-        - Configurable retry attempts (set by customer).
+    2. **Capture Failure Reasons**
+
+        - Introduce a `failure_log` or `failure_response` column that stores detailed reasons or HTTP responses for each failed attempt which helps with root cause analysis and improves observability for both developers and users. The necessity of this field depends on the retry strategy implemented.
+    
+    3. **Implementing Retry**
+        - **Model Retry Jobs Separately**
+            - Treat retries as separate job entries with a new `job_id`, and link them to their original job using a `parent_job_id` column.
+            - If a job fails, instead of blocking the current flow, the executor can requeue the job into the broker (Kafka/SQS).
+            - This gives complete traceability of retries and their individual outcomes and users can view a lineage of job executions, making it easier to identify which retries succeeded and which failed.
+
+            - These can lead to SLA breaches, especially if retries are queued behind many new tasks.
+            - To avoid this, retries can be prioritized or handled by dedicated retry consumers.
+            - In this approach, no additional fields are required since each entry in the job table represents a single HTTP call. The corresponding response is already captured in the `response` column, providing sufficient visibility into the outcome of each attempt.
+
+        
+        - **Configurable Retry Strategy**
+            - Allow users to define retry behavior via configuration:
+                - Number of retry attempts
+                - Delay between retries
+                - Timeout for each HTTP call
+            
+            - This is handled using a simple `for` loop, where the maximum number of retries is defined by a user-configurable parameter. The loop exits immediately upon receiving the first successful HTTP response.
+            - In this implementation as well, it's preferable not to introduce additional fields for storing failure responses, since those fields would remain empty for jobs that succeed on the first attempt. Instead, it's more efficient and consistent to log all HTTP responses—whether from success or failure—within the existing `response` column.
 
 ##  Puller Query & Performance Tuning
+
+Let’s now focus on the **SQL query executed by pullers** to fetch jobs from the `Job` table and enqueue them for processing.
+
+The current query in use is detailed in [This Tab](#problem-6-maintaining-exclusivity-with-multiple-pullers-for-one-tenant)  located under **Solution-3: Using SKIP LOCKED**.
+
+This approach ensures that multiple pullers can operate concurrently **without processing the same job**, enhancing both efficiency and throughput.
 
 Why Limit in SQL Query is Needed:
 
