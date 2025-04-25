@@ -480,68 +480,100 @@ The current query in use is detailed in [This Tab](#problem-6-maintaining-exclus
 
 This approach ensures that multiple pullers can operate concurrently **without processing the same job**, enhancing both efficiency and throughput.
 
-Why Limit in SQL Query is Needed:
+Let’s revisit why it’s important to use a `LIMIT` when writing the SQL query for pullers:
 
-- Without LIMIT, one puller can lock 10K tasks.
+- Without a `LIMIT`, if the `WHERE` condition matches, say, **10K** tasks, the puller will attempt to **lock all of them at once**. This leads to a situation where only one puller processes everything, while **others remain idle**, defeating the purpose of **parallelism** with multiple pullers. Consequently, maintaining **SLA** becomes difficult, and scalability suffers.
 
-- Prevents load balancing among multiple pullers.
+How `LIMIT` Helps Orchestration:
 
-- Can lead to SLA violations.
+- When we use a LIMIT, we control how many tasks each puller handles per cycle. This enables the **orchestrator** to make **smart decisions** about scaling—i.e., when to add or remove pullers. For example: 
+    - Suppose processing a single task takes 15ms.
+    - If each puller picks **2 tasks** per cycle (`LIMIT = 2`), and we have **10 pullers**, then:
 
-Optimizing Puller Count:
+        - Total time for 10K tasks = `(10,000 * 15ms) / (2 tasks * 10 pullers)` = **7.5 seconds**.
+    
+    - When we introduce an orchestrator to dynamically add or remove pullers based on system load, the key question becomes: **how does the orchestrator determine when more pullers are needed?** 
+    
+        Using the above logic, the orchestrator can calculate the number of pullers needed to meet a given SLA within a fixed time window.
 
-- Use task processing time and queue size for dynamic scaling.
-- Example Calculation:
+## Handling Recurring Jobs
 
-    - 10K tasks, 15ms per task
-    - Limit = 2, Pullers = 10
-    - Total time = (10,000 * 15ms) / (2 * 10) = 7.5s
-- Orchestrator can use this to decide how many pullers are needed.
+Now that we’ve addressed single-time execution of a task, let’s explore how to extend this solution for recurring tasks. For example, a customer might submit a task on April 26, 2025, at 10:00 AM, and request that it run **every day at 10:00 AM**, or even **every minute** in more complex scenarios.
 
-## Support for Recurring Jobs
+**Key Principle:** We should **build on top of the existing one-time execution flow**, not create an entirely separate solution.
 
-Recurring jobs (e.g., daily 10 AM execution) need a robust system to track executions and plan future ones.
+- **Customer Expectations:**
 
-**Problem with One Table Design:**
+    From a user experience standpoint, once a recurring job is submitted, customers should be able to:
 
-- Adding recurring logic in the same jobs table complicates schema.
-- Makes updates/deletes for future jobs cumbersome.
+    - View the number of **completed occurrences**.
+    - See a list of **upcoming scheduled executions** in the UI (via the Jobs table).
 
-**Solution:** Split into `tasks` and `jobs` Tables
+    This implies that a certain number of future job entries should **always exist** in the Jobs table to ensure upcoming executions are properly scheduled and visible.
 
-**Tasks Table (Like a Program):**
+- **Possible Design**
 
-- Fields: `task_id`, `tenant_id`, `cron_schedule`, `scheduled_at`
-- Represents a high-level user-defined task
+    When a customer creates a **recurring job**, the system should **immediately generate a fixed number** (e.g., 10) of job entries in the Jobs table for future execution. Once a job is picked by a puller, processed by the executor, and completed:
+    - If it is a recurring job, the executor will **create a new entry** in the Jobs table for the next occurrence
 
-**Jobs Table (Like a Process):**
+    - The system must ensure that this new occurrence does **not duplicate** any already scheduled times.
 
-- Fields: `job_id`, `task_id` (FK), `scheduled_at`, `started_at`, `picked_at`, `completed_at`, `status`, `response`, `sla_met`, `retry_count`
+    - Required metadata:
+        
+        To support this behavior, we need to introduce **new columns** in the Jobs table:
+            - `is_recurring` (boolean): Indicates whether the job is a recurring one.
+            - `recurrence_interval` (e.g., `1 day`, `1 minute`): Defines the time gap between executions.
+    - For one-time jobs, these columns will remain `NULL`. Adding these columns impacts the current schema, but it's a necessary and minimal extension to enable powerful recurring task support without breaking the existing design.
 
-- Represents each execution of a task
+    - Also, ensuring that executors do not create **conflicting entries** for recurring tasks adds complexity. Executors must be aware of the **latest scheduled timestamp** for that task to avoid duplications. This becomes even more challenging when **multiple executors** are running concurrently, or when some **executor instances fail to add the next occurrence**, potentially leading to gaps in the schedule.
 
-Benefits:
+## Designing for Recurring and One-Time Jobs: Using the Concept of Program vs. Process
 
-- Easier updates/deletes for recurring tasks
+To solve the problem of managing one-time and recurring tasks more effectively, we borrow a fundamental concept from Operating Systems — the distinction between **a program and a process**:
 
-- Clean separation of scheduling vs. execution
+- **Program:** Static code written to perform a task (analogous to our Task).
+- **Process:** A running instance of a program (analogous to our Job).
 
-## Future Job Scheduling for Recurring Tasks
+- **Proposed Solution: `tasks` and `jobs` Tables**
 
-When a recurring task is submitted:
+    - **We introduce two tables in our design:**
 
-- Pre-create 5-10 future job entries
+        - `tasks` table: Represents what the user submits — the abstract definition of a job, like a program.
 
-- Executor checks if it's a recurring job during execution
+            - Fields: `id`, `tenant_id`, `cron_schedule` (one-time or recurring), `scheduled_at`, etc. The `scheduled_at` field will always reflect the **farthest timestamp in the future** for which a job has been scheduled, ensuring the system knows up to when the task has been planned.
+        
+        - jobs table: Represents each actual execution — like a process.
 
-- If yes, it creates the next future occurrence (ensures future jobs always exist)
+            - Fields: All runtime-related data including `job_id`, `task_id` (FK), `scheduled_at`, `started_at`, `picked_at`, `completed_at`, `status`, `response`, `sla_met`, `retry_count`
 
-- Use `cron_schedule` from tasks table to generate the next `scheduled_at`
+    - **Benefits of This Design:**
+        - `tasks` hold the static definition, while `jobs` hold the execution-level data. Users can click on a task to see either all jobs or only those related to that task.
 
-## Multi-Tenant and Rate-Limited Pullers
+        - For recurring tasks, users won’t need to update or delete each future-scheduled job manually. By updating or deleting the corresponding `task`, the system can automatically update/delete related jobs in bulk.
 
-To support tenants with different throughput requirements:
+    - **Handling Job Generation:**
+        - When a user submits a **new task:**
+            - If it’s **a one-time job**, one corresponding entry is created in the `jobs` table.
+            - If it’s **a recurring job**, a batch of, say, 5 future job entries is created in advance.
 
-- Pullers should be tenant-aware
-- This allows rate limiting, throttling, and dedicated infra per tenant
-- Improves SLA adherence for high-priority customers
+    - **Auto-Scheduling Additional Jobs:**
+        - To ensure continuous execution for recurring tasks:
+            - When a **puller picks** a `job` from the jobs table, it can:
+                - Use the `task_id` to fetch the related entry from the `tasks` table.
+
+                - Determine if it's a recurring task by checking the `cron_schedule`.
+
+                - Look at the latest `scheduled_at` timestamp in the jobs table for that task.
+
+                - Then generate additional future jobs as needed and update the `scheduled_at` in the `tasks` table.
+    - To support tenants with different throughput requirements:
+
+        - Pullers should be tenant-based
+        - This allows rate limiting, throttling, and dedicated infra per tenant
+        - Improves SLA adherence for high-priority customers
+
+So the current tables look like this -- 
+
+![](Pictures/10.png)
+
+
