@@ -131,66 +131,197 @@ To give a sense of efficiency:
 
 ## Implementation Using Redis HyperLogLog
 
-Redis commands:
+Redis provides a very simple and efficient API for working with HyperLogLog through three primary commands:
+- PFADD
+- PFCOUNT
+- PFMERGE
 
-- PFADD <source_key> <user_id>
-- PFCOUNT <source_key>
-- PFMERGE <destination_key> <source_key1> <source_key2> ...
+![](Pictures/3.png)
 
-Data Model:
+#### How it Works:
 
-- Key Format: adID_YYYYMMDDHHMM
-- Example: A1_202504261000
-- Store per minute granularity.
+We will continue using a key-value structure similar to what we discussed earlier:
+- Keys represent a **combination of ad ID and minute-level timestamp**.
+    - Key Format: adID_YYYYMMDDHHMM
+    - Example: A1_202504261000 -> 26th April 2025, 10:00AM
+- Values are **HyperLogLogs storing user presence information**.
 
-## Usage Flow:
-
-1. Add View Event:
-
+#### Usage Flow Example:
+- When a user A sees an ad A1 at 26th April 2025, 10:00AM, we execute:
     ```nginx
-    PFADD A1_202504261000 userA
+    PFADD A1_202504261000 A
+    ```
+    This adds `user A` to the HyperLogLog value of the key `A1_202504261000`.
+
+    Syntax of `PFADD` command -- 
+    ```nginx
+    PFADD <key> <user_id>
     ```
 
-2. Query Unique Views (timeframe):
+- Now, suppose a user wants to see how many **unique users** viewed ad `A1` between **10:00AM** and **10:03AM**.
+We need to merge the relevant keys using `PFMERGE`:
 
     ```nginx
-    PFMERGE temp A1_202504261000 A1_202504261001 A1_202504261002
-    PFCOUNT temp
+    PFMERGE t_A1_202504261000 A1_202504261000 A1_202504261001 A1_202504261002 A1_202504261003
     ```
+
+    This creates a **temporary key** `t_A1_202504261000` that merges the HyperLogLogs values of the given keys.
+
+    Syntax of `PFMERGE` command -- 
+    ```nginx
+    PFMERGE <key> <source_key1> <source_key2> ...
+    ```
+
+    Now, we can get the approximate unique count with `PFCOUNT`:
+    ```nginx
+    PFCOUNT t_A1_202504261000
+    ```
+
+    Syntax of `PFCOUNT` command -- 
+    ```nginx
+    PFCOUNT <key>
+    ```
+
+## Handling HyperLogLog Data
+
+Redis also allows us to **extract** and **reinsert** HyperLogLog data:
+- We can use `GET` or `DUMP` to retrieve the data for a key that holds a HyperLogLog.
+- Redis will return a hexadecimal representation of the internal byte array.
+- his byte array can be stored, transferred, or even restored onto the same Redis server (or a different one) simply by using the regular `SET` command with the hexadecimal value.
+
+This mechanism is very helpful for:
+- Backup
+- Migration
+- Replication across clusters
+
+## Prevent Fraudulent Activity to increase count
+
+In real-world adtech systems, it’s important to **prevent malicious behavior**, such as ad agencies trying to inflate view counts by accessing their own ads from multiple accounts.
+
+To address this, we **should not blindly add every request** to the HyperLogLog. Instead, we introduce a **rule engine** to validate incoming events.
+
+#### Rule Engine Overview:
+
+The rule engine acts as a black box that:
+- Accepts input (such as user ID, IP address, timestamp, etc.)
+- Applies validation logic
+- Filters out suspicious or invalid events, the events that passes the test are elegible to get added in the hyperloglog in redis. 
+
 ## System High Level Design
 
-- Ingestion Path (Write Path)
-    - User sees Ad → API server receives event.
-    - API server → Kafka → Async ingestion.
-    - Rule Engine (filter bad traffic) —> another Kafka topic.
-    - Consumers update Redis HyperLogLog (PFADD).
+The flow till no we have discussed -- 
 
-- Benefits:
-    - Async ingestion prevents Redis overload.
-    - Rule Engine ensures quality.
-    - Kafka ensures durability, reprocessing, scalability.
+1. User Views Ad → Request hits the HTTP API Server
+2. Rule Engine Validation → The request is forwarded to the Rule Engine, which determines if the event is valid
+3. Update Redis → Valid events are sent to Redis, where user IDs are added to HyperLogLog structures using `PFADD`
+4. Advertiser Dashboard Analytics
+    → Advertisers access a UI to monitor ad performance
+    → The UI calls an Ad Analytics Server → The server performs `PFMERGE` (if needed) and `PFCOUNT` to get the approximate unique user count
+    → The result is returned to the frontend for visualization
 
-## Persistence and Durability
+Here we can logically divide the system into two key paths:
+- **Write Path:** From User viewing the ad to data being written to Redis
+- **Read Path:** Advertisers query the analytics dashboard to view ad performance, ad analytics server returns `PFCOUNT`.
 
-- Problems:
-    - Redis is in-memory.
-    - Need persistent backup.
+![](Pictures/5.png)
 
-- Solutions:
-    - Dual Consumers:
-        - One writes to Redis.
-        - One writes raw data to S3/MySQL/PostgreSQL.
-    
-    - Why Backup First Kafka Topic (pre-Rule Engine)?
-        - Ensures replayability if rules change.
-        - Filter again from backup if needed.
+## Scalability Issues and Practical Fixes: Write Path
 
-## Replayability Architecture
-- Pull old events from S3 (Backup DB).
-- Push into Kafka for reprocessing.
-- Apply Rule Engine again.
-- Update Redis / persistent stores if needed.
+### 1. Problem: Redis Overload Due to High Write Volume
 
+In the current architecture, every user view or click on an ad directly triggers a `PFADD` operation in Redis to update the HyperLogLog structure for unique user tracking if validates by rule engine. Since these writes are **synchronous**, a high spike in user activity (especially during peak hours or viral campaigns) can:
+
+- Overwhelm Redis with write requests.
+- Introduce latency at the API layer.
+- Risk data loss if Redis is temporarily unavailable or unable to scale fast enough.
+
+#### Solution
+
+To address this scalability issue, we shift from a **synchronous** to an **asynchronous** architecture:
+
+- **Message Queue as a Buffer:** We place a message queue (kafka or SQS) between the API server and Redis.
+    - The API server publishes events (ad views/clicks) to Kafka.
+    - This makes the API layer more responsive and prevents it from blocking due to Redis performance.
+
+- **Consumers for Redis Writes:** A pool of Kafka consumers processes these events.
+    - Each consumer reads user interaction events from Kafka and performs the corresponding `PFADD` to Redis.
+    - Since Redis `PFADD` takes only one value per call, consumers process events individually but at their own pace, avoiding a Redis write storm.
+
+- **Requirements for the Queue System:**
+    - High durability (no message loss)
+    - High throughput for both reads and writes
+    - High availability to ensure continuous data flow even under failure conditions
+
+    Kafka and SQS both satisfies all this conditions
+
+- **Trade-off:** This approach introduces a slight delay in updating the view counts, but it’s a worthy trade-off.
+
+So the current architecture looks like this -- 
+![](Pictures/6.png)
+
+### 2. Problem: Redis is In-Memory and Non-Persistent
+
+Redis stores all data in RAM, which means it's volatile and doesn't guarantee data persistence. In the event of a Redis failure or restart, all data stored in memory could be lost. This is a critical issue when tracking unique ad views or user interactions that must not be lost. Furthermore, we might want to reuse the same event data for other use cases like time-series analysis, debugging, or compliance logging, which Redis is not designed to support.
+
+#### Solution:
+
+To ensure durability and support multiple downstream use cases, we can introduce a second set of consumers that read the same data from the message queue and store it in a persistent storage solution such as Amazon S3, MySQL, or PostgreSQL. This setup not only safeguards the data in case Redis fails but also enables:
+
+- Long-term storage for analytics or audits
+- Time-series analysis of ad view trends
+
+To support this, the message queue must provide **multi-consumer support**, high availability, and high throughput. Since SQS doesn't support multiple consumer groups natively, **Kafka** is appropriate choice here.
+
+So the current architecture looks like this -- 
+![](Pictures/7.png)
+
+### 3. Problem: Where Should the Rule Engine Sit
+
+As the number of events increases and the logic becomes more complex, we need to determine:
+- Where should the rule engine be placed in the data flow?
+
+#### Solution: 
+
+- The rule engine should acts as the first consumer from the primary Kafka topic (Kafka-1) where the API server is pushing the data. 
+- Consumers pull data from the primary Kafka topic to a processing server where the filtering logic is executed. The filtered (cleaned) data is then published to a secondary Kafka topic (Kafka-2) for downstream consumption.
+- All other downstream consumers (e.g., Redis updaters, analytics systems, etc.) will consume from Kafka-2.
+
+![](Pictures/8.png)
+
+### 4. Problem: Where to Persist Data, Kafka-1 or Kafka-2
+
+Now from which Kafka topic should we persist the data into a persistence database like S3 or MySQL?
+
+We want to ensure:
+- Proper filtering of incoming ad interaction events (e.g., rule out malicious activity).
+- Efficient and **replayable architecture**, in case of logic changes or bugs.
+- Minimized **redundant computation** by storing meaningful intermediate data.
+
+#### Solution:
+
+- Persistence Strategy
+
+    - We might consider persisting data from **Kafka-2** (after filtering), since it excludes any invalid or unwanted events. 
+    - However, we may also want to persist data from **Kafka-1** (before filtering), as it gives us the flexibility to replay the rule engine later if needed. While **Kafka-1** data allows reprocessing with updated or corrected rules, **Kafka-2** offers already cleaned data that saves compute time. 
+    - The trade-off is: 
+        - Data from **Kafka-2** cannot be reverted back to the original raw form but we already spend much time and CPU resources to compute this data. 
+        - **Kafka-1** enables full replayability.
+        
+    - Both approaches have their own advantages and disadvantages, and the choice depends on the use case and system requirements.
+
+    - To support **replayability and debugging**, we should persist data **from both Kafka-1 and Kafka-2** to a durable storage like Amazon S3. This dual storage strategy avoids recomputation and saves compute cost.
+
+    ![](Pictures/9.png)
+
+- Replayability Use Cases
+    - Replay is needed when:
+        - Rules change (additions, removals, or fixes).
+        - Bugs are discovered in previous logic and require reprocessing of historical data.
+    - For this, we can:
+        - Spin up a temporary consumer that reads from **S3**, re-inserts into **Kafka-1**, and reprocesses through the rule engine.
+        - This setup should be **on-demand**, not always running, to save costs and resources.
+
+## Scalability Issues and Practical Fixes: Read Path
 ##  Read Path (Analytics Query Path)
 - Advertiser queries for ad stats.
 - Query Redis for recent timeframe.
