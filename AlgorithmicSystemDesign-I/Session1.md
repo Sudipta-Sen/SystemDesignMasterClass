@@ -322,42 +322,116 @@ We want to ensure:
         - This setup should be **on-demand**, not always running, to save costs and resources.
 
 ## Scalability Issues and Practical Fixes: Read Path
-##  Read Path (Analytics Query Path)
-- Advertiser queries for ad stats.
-- Query Redis for recent timeframe.
-- If old data needed → pull from Persistent DB (DynamoDB or others) into Redis.
-- Perform PFMERGE and PFCOUNT on Redis.
-- Return result to client.
 
-## Sharding and Storage Management
+### 1. Problem Scalability
 
-- Why?
-    - Redis can't store infinite historical data.
+Since there are many ads and multiple advertisers accessing analytics concurrently, a single Redis instance will not be sufficient to handle the load. To scale the system effectively, we need to implement Redis sharding to distribute data across multiple nodes and use read replicas to serve high read traffic. For managing configuration and coordination between distributed components, we can leverage **Zookeeper** for centralized config management and service discovery.
 
-- Strategies:
-    - Shard Redis based on adID, time.
-    - Move old HLL data to DynamoDB (or ElasticSearch).
-    - Use TTL (time to live) for Redis keys.
+### 2. Managing Redis Memory and Persistent Storage for Ad Analytics
 
-## Storage Optimization: Aggregation
+Redis is an in-memory datastore, and it is not feasible to store all data across the entire lifespan of an ad—especially when ads may run for weeks or months. Continuously accumulating this data in Redis would lead to unbounded memory growth. To address this, we implement **data offloading** by moving older data from Redis to a **persistent database** after a fixed time window (e.g., 30 minutes).
 
-- Problem:
-Querying 4 hours = 240 minute-level keys!
+#### Key Requirements for the Persistent DB
+To decide on a suitable persistent storage, we first analyze the type of queries we expect. Suppose Redis retains **only the last 30 minutes of data**. If a client requests analytics for the past 4 hours, we need to:
+- Fetch 30 minutes of data from Redis,
+- Fetch the remaining 3.5 hours from the persistent DB,
+- **Merge all** the relevant data using `PFMERGE` (since we are using HyperLogLog),
+- Return the final approximate count using `PFCOUNT`.
 
-- Solution:
-    - Periodic Aggregation:
-        - Aggregate minute-level data → hour/day level.
-        - Store aggregation in DynamoDB.
+However, persistent databases do not understand Redis-specific data structures like HyperLogLog. So, we use the Redis `DUMP` command to export the HyperLogLog as a **hexadecimal-encoded binary blob** and store it in the database, using the **Redis key format** as the identifier. 
 
-- How?
-    - Aggregator server fetches minute HLLs from Redis, merges them, stores coarser-grained HLLs into DynamoDB.
+When a query is made:
+1. Keys for the required time range are identified.
+2. For keys not present in Redis, the corresponding data is fetched from the persistent DB.
+4. A `PFMERGE` operation is performed across all relevant keys.
+5. The result is obtained using `PFCOUNT`.
 
-## Compute-Storage Separation
+So the requirements for the persistence DB are -- 
+1. **Key Consistency:** The keys in the persistence DB must match the keys in Redis
+2. **Binary Storage (BLOB Support):** Since Redis HyperLogLog data is dumped as a hexadecimal-encoded byte array, the DB must support storing this as Binary Large Object (BLOB)
+3. **Key-Value Access Pattern**
+4. **Range Query Support:** To support time-window queries
+5. Sharding
+6. Persistence & High Availability
 
-- Further optimization:
-    - Separate compute Redis cluster for merging/querying (not main Redis).
-- Storage: Redis + DynamoDB
-- Compute: Separate Redis Cluster
-- Benefits:
-    - Scale compute independently.
-    - Reduce load on main Redis.
+DynamoDB supports all this requirements. 
+
+### 3. Where Should We Perform PFMERGE
+
+The `PFMERGE` operation is specific to Redis and is used to merge multiple HyperLogLogs into one. Since **persistent databases have no understanding of Redis data structures** like HyperLogLog, they **cannot perform operations like** `PFMERGE` or `PFCOUNT`.
+
+Therefore, all HyperLogLog operations must be done within **Redis**.
+
+If some of the required data is already offloaded to the persistent store, we follow this process:
+
+1. Fetch the serialized (dumped) HyperLogLog blobs from the persistent database.
+2. Load them temporarily into Redis using the same keys (with a short TTL).
+3. Perform the `PFMERGE` in Redis across the required keys.
+4. Get the approximate count using `PFCOUNT`.
+
+![](Pictures/10.png)
+
+### 4. Problem: Inefficient HyperLogLog Merge
+
+Let’s consider an extreme but realistic scenario:
+
+Suppose we want to estimate the number of **unique ad viewers over the past 4 hours**, and we're currently storing data at **1-minute granularity in Redis**. That means we need to merge `4 × 60 = 240` HyperLogLog keys using the `PFMERGE` command.
+
+A `PFMERGE` operation with **240 arguments** is inefficient — it increases network overhead, CPU load, and memory usage on Redis.
+
+#### Solution: 
+
+To solve this, we introduce **pre-aggregated HyperLogLog data** at coarser levels of granularity (e.g., 15 minutes, hourly, daily). Here's how the architecture evolves:
+
+1. **Aggregator Server:** A dedicated service runs periodically and:
+
+- Fetches fine-grained (minute-level) HyperLogLog data from the **main Redis server** and **DynamoDB**.
+- Merges the keys in a **separate lightweight Redis instance** (used only by the aggregator).
+- Dumps the aggregated result into **DynamoDB** as serialized blobs.
+- These blobs are stored under keys that reflect their aggregation level — e.g., `A1_202504261200_hr` (hourly), `A1_20250426_dy` (daily), etc.
+
+2. **At Query Time:**
+
+- For a 4-hour analytics request, the system:
+    - Pulls **last 30 minutes** of data (30 keys) directly from Redis (still in memory).
+    - Pulls **3 hours** of hourly aggregates from DynamoDB (3 keys).
+    - Pulls another **30 minutes** of minute-level aggregates from DynamoDB (30 keys).
+
+- In total, **63 keys** (instead of 240) are loaded into Redis for `PFMERGE`.
+
+3. **Key Format Convention**
+
+    To distinguish aggregation levels, we follow a naming convention:
+    - mi → minute-level
+    - hr → hour-level
+    - dy → day-level
+
+    Example: `A1_202504261215_mi`, `A1_2025042612_hr`, `A1_20250426_dy`
+
+    ![](Pictures/11.png)
+
+### 5. Optimization: Offload Read Queries to a Separate Redis Cluster
+
+When handling read-heavy analytics queries (e.g., "**fetch last 4 hours of unique views**"), we currently load historical data into the **main Redis cluster** from both Redis (for recent data) and DynamoDB (for older data), then perform `PFMERGE` and `PFCOUNT`. 
+
+This approach **increases the load** on the main Redis cluster, which is already handling write operations at scale.
+
+#### Solution: Decouple Compute from Storage
+
+To reduce pressure on the main Redis cluster, we can introduce **a separate Redis cluster** that is **dedicated to read queries**. Here’s how it works:
+
+1. **Query Redis Cluster (Compute Redis):**
+    - Fetches data from the **main Redis** (recent HLLs) and **DynamoDB** (aggregated historical HLLs).
+    - Loads the required HyperLogLog keys into newly introduced redis.
+    - Performs `PFMERGE` and `PFCOUNT` locally.
+    - Returns the result to the client.
+
+2. **Storage-Compute Separation:**
+    - The **main Redis cluster** and **DynamoDB** act as **storage layers**.
+    - The **new Redis cluster** acts as the **compute layer**.
+    - Each layer can now be **scaled independently** based on query volume or storage needs.
+
+3. **Additional Flexibility**
+    - Instead of DynamoDB, we can also use **Elasticsearch** for storing and querying historical aggregates, especially if we want **more flexible querying** or **full-text search** on the data.
+    - This pattern allows us to avoid loading large data sets into a Redis instance that is critical for real-time write workloads.
+
