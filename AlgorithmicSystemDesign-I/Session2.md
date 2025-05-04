@@ -54,8 +54,8 @@ Introduce a metadata database that:
 
 - Stores either the **chunk IDs** or their **storage locations** and maps filenames (like `video.avi`) to chunk IDs (e.g., `c1`, `c2`, `c3`, `c4`)
 - We’ll use **pre-signed URLs** to upload each chunk directly to cloud storage. On the backend, we'll maintain the metadata table.
-- Keeps chunk paths static (independent of file name)
-- Enables fast rename by just updating the DB entry and efficient access
+- Keeps chunk paths static (independent of file name). 
+- By not joining chunk names with file names, makes renaming efficient, just updating the DB entry and efficient access
 
 🔐 Chunk ID Generation and Integrity:
 
@@ -81,6 +81,7 @@ Hashing makes the system **content-addressable**—like Git. Identical chunks ac
     - Metadata DB Table Schema
         - `account_id`: User account ID
         - `path`: File path relative to Dropbox folder (e.g., `/exam/random.avi` i.e `random.avi` is present inside a folder `exam` in the dropbox folder)
+            - Path is logical, not physical.
         - `blocklist`: Ordered list of chunk IDs (e.g., h1,h2,h3)
 
 #### Summary of upload flow
@@ -144,103 +145,165 @@ These queries return the file's relative path, associated chunk IDs (as blocklis
 
 The `blocklist` column maintains the ordered list of chunk IDs (e.g., `h1`,`h2`,`h3`,`h4`). While storage order doesn’t matter, this sequence is essential for proper reconstruction of the file during sync or download.
 
-## Workflow Overview
+#### Lazy vs. Eager Download Strategy
 
-3. Uploading Chunks to Cloud (Resumable Upload)
+Once a file change is detected, the Dropbox client has two options for downloading:
 
-    - Requirements:
-        - Upload only the chunks that don’t exist.
-        - Avoid re-uploading if upload partially failed earlier.
-    
-    - Strategy:
-        - Client calls API → “I want to commit file /video.avi with blocklist: [h1, h2, h3, h4]”
-        - Meta Server (API) checks S3 for which chunks are missing
-        - Meta Server responds with missing chunks list
-        - Client uploads only those missing chunks using presigned URLs
-        - Once all chunks are uploaded, client calls API again
-            - If all chunks exist → entry is made in DB (commit)
-    
-        This ensures resumable uploads and avoids duplicate uploads.
+1. **Eager Download:** Immediately download the updated chunks as soon as the change is detected.
+2. **Lazy Download:** Just create placeholder entries (e.g., 0B files or metadata entries) and defer the actual download until the user opens or accesses the file. When user tries to access the file, it downlaod the chunks, reconstruct the file and serves to user. 
 
-4. Metadata DB Design
+Lazy download improves performance and saves bandwidth when many files are changed but not immediately needed.
 
-    - Table Schema
-        - `account_id:` User account ID
-        - `path:` File path relative to Dropbox folder (e.g., /exam/random.avi)
-        - `blocklist:` Ordered list of chunk IDs (e.g., h1,h2,h3)
-        - `version_id(vid):` Monotonically increasing version number per user
-        - `timestamp:` File update time if not using vid
+- **Note:** Download and upload are done directly via **pre-signed S3 URLs**, as previously discussed. Since the same user typically uploads and downloads the file across their own devices, **a CDN is unnecessary**—the latency and distribution needs are minimal.
 
-    - Path is logical, not physical.
-    - Chunk names are not tied to file names, making rename efficient.
-    - Storing hash in blocklist allows detecting file corruption and deduplication.
+## Multi-Versioning Instead of Overwriting
 
-## Sync Across Devices
+Initially, we updated the `blocklist` and `updated_at` columns in-place to reflect changes. But instead, we can **append new rows** to maintain **version history** of each file i.e making a new entry in the DB whenever there is a modification or addition:
 
-#### How do other devices know if a file changed?
-
-- Every client keeps track of latest vid it has synced.
-- Periodically, client polls Meta Server:
-    ```arduino
-    "Give me entries after vid = X for account_id = Y"
-    ```
-- New entries (with higher vid) are sent.
-- Client compares chunk hashes with local ones to:
-    - Download only new chunks
-    - Reconstruct file from chunks
-
-####  Lazy vs Eager Download
-- Eager: All updated chunks downloaded immediately.
-- Lazy: Only metadata pulled; chunks are downloaded when user accesses the file (0-byte placeholder). 
-- For lazy load:
-    - When user clicks a file → download chunks → reconstruct file → temporary cache → serve to user
-
-####  File Versioning
-
-Instead of updating DB row, insert a new row for every file update.
-
-| version_id |	path	| blocklist	| account_id |
+|account_id	| path | blocklist |	timestamp |
 |---|---|---|---|
-| 12	| /video.avi |	h1,h2,h3,h4	| A123 |
-| 13 |	/video.avi |	h1,h2,h3',h4 |	A123 |
+| A123	| /video.avi |	h1,h2,h3,h4 |	10:22 |
+| A123	| /video.avi |	h1,h2,h3',h4 |	11:22 |
 
-- Client fetches latest version by max `vid`.
-- Easy to revert to older version.
-- Avoids need for `is_active` boolean column.
+To improve consistency and avoid timestamp collisions, we can add a vid(version ID) column and monotonically increasing vid instead of timestamps:
 
-## API Design
+| vid |account_id	| path | blocklist |
+|---|---|---|---|
+|1 | A123	| /video.avi |	h1,h2,h3,h4 |
+|2 | A123	| /video.avi |	h1,h2,h3',h4 |
 
-1. Commit API (PUT /<file_path>)
+This design ensures:
+- Each version of a file is preserved.
+- Clients can sync by saying: “I have data up to `vid = x`; give me everything after that.”
+- `vid` must be **unique per user** but not globally. This is similar to Jira ticket numbers that reset per project.
 
-    Client calls:
+## Unified File Upload API Design (Dropbox server API)
 
-    ```bash
-    PUT /video.avi
-    Payload: blocklist=[h1,h2,h3,h4]
+When uploading a file (new or modified), should Dropbox client expose two separate APIs—**one for creation** and **one for modification**?
+
+**Initially, it seems logical** to separate the two operations due to their functional differences. However, from the **backend/database perspective**, both actions—creating a new file or updating an existing one—follow a very similar process:
+1. **Upload file chunks to S3 (block server)** if they do not already exist.
+2. **Insert or update metadata** (file path, blocklist) in the database (meta server).
+
+Thus, we can consolidate both actions actions **modify and add** under **a single `PUT` API**:
+```css
+PUT /<relative_path> 
+Body: blocklist = [h1, h2, h3, h4]
+```
+### Upload Flow: Commit Protocol
+To avoid inconsistencies and partial uploads, we adopt a commit-style protocol involving two roles:
+- **Block Server (S3):** Stores file chunks.
+- **Meta Server (API server):** Stores file metadata and manages coordination.
+
+Here’s how it works:
+
+1. **Change Detection**
+
+    Dropbox client detects a file change (e.g., video.avi) via FSNOTIFY.
+
+2. **Chunking & Hashing**
+    
+    The client splits the file into chunks and computes SHA256 hashes for each chunk: `h1, h2, ..., hn`.
+
+3. **Commit Request to Meta Server**
+    
+    The client calls the API:
+    ```css
+    PUT /video.avi 
+    Body: blocklist = [h1, h2, ..., hn]
     ```
+    
+    This indicates intent to "commit" the file with given chunk hashes.
 
-    Server Flow:
-    - Check which chunks exist in S3
-    - Return missing chunk list
-    - Client uploads those chunks using presigned URLs
-    - Client retries the same PUT call
-    - If all chunks exist → server commits entry in DB
+3. **Missing Block Detection**
+    
+    Meta server will not allow client to directly upload all the chunks in S3. It will only allow chunks that are not there in S3 to get uploaded. 
+    
+    So the Meta Server checks with the block server (S3) to identify which of the chunks are missing. Only **S3 can reliably determine this**.
 
-2. Get Updates API
-    ```bash
-    GET /sync?account_id=A123&after_vid=42
+4. **Presigned Uploads**
+    
+    The Meta Server responds client with a list of missing chunks and their respective **presigned URLs**. Dropbox client uploads those missing chunk. 
+5. **Chunk Upload**
+    
+    The Dropbox client uploads only the missing chunks to S3. 
+6. **Repeat Until Success**
+
+    The client reissues the same `PUT` request. This process repeats until the Meta Server confirms all chunks exist in S3 (i.e., the missing list is empty).
+
+7. **Finalize Entry in DB**
+    
+    Once all chunks are uploaded, dropbox client initiate the action to create or update the metadata in the database (meta server). So we need separete API for that. 
+    ```css
+    PUT /commit
+    Body:
+        {
+            "path": "/video.avi",
+            "blocklist": ["h1", "h2", "h3", "h4"],
+            "account_id": "user_123"
+        }
     ```
-    Returns all new versions for that account.
+    - Creating the metadata entry before ensuring that all chunks are uploaded can lead to inconsistencies:
+        - **Failed uploads:** If the chunk upload fails after the DB entry is created, the sync process breaks—other devices see metadata but can't fetch the file.
 
-## Multi-versioned File Consistency
-- New device joins → gets all metadata
-- Syncs chunk-by-chunk only if required
-- Chunks are shared across files if identical (de-duplication)
+        - **Partial uploads:** Large files with slow network could result in long upload times. If another device tries to sync while the upload is incomplete, it may receive an error saying the file doesn't exist.
+    
+        This protocol ensures **atomicity and consistency**. A file entry is created **only when all required chunks are present** in the block server.
+
+#### Why This is Robust
+- Avoids premature DB entry creation that could break sync on other devices.
+- Prevents unnecessary chunk uploads during retries.
+- Works the same way for both new files and file modifications:
+    - **New File** → All chunks uploaded.
+    - **Modified File** → Only changed chunks uploaded.
+
+## Multiversioning of file
+
+When we create a new database entry for every file **update, revert, or creation**, we automatically **enable multiversioning** of files. But then how to keep track of the current version of a particular file? Most commonly we can use a separate `is_active` flag to track the current version.
+
+Instead of marking one version as active ( using a boolean `is_active` column), we rely on the **monotonically increasing** `version_id` to determine the most recent state. For each user, the combination of `account_id` and the highest `version_id` for a given file path represents the latest version.
+
+### Efficient Sync Strategy (Change Detection)
+
+![](Pictures/13.png)
+
+When a Dropbox client wants to sync:
+
+1. It tells the API server:
+
+    "**I have all data till** `version_id = X`. **Tell me what's new.**"
+
+2. The server responds with entries having `version_id > X` for that `account_id`.
+3. The client:
+    - Checks the new entries’ blocklist.
+    - Compares them with its local blocklists.
+    - Downloads only the changed chunks (e.g.,` h6 → h6'`, `h3' → h3`) using pre-signed S3 URLs.
+
+    This approach avoids sending unchanged chunks and minimizes data transfer.
 
 ## Related Systems
 - Git: Uses content-addressed storage (hash-based chunking)
 - Google Drive: Also supports multiversioning (but serves full files for in-browser playback)
 - S3: Native versioning support (not used here due to chunking design)
+
+## In-Browser File Viewing & Chunking Limitations
+
+When providing an **in-browser viewing experience** (like Google Drive’s in-picture video playback), the chunked file model poses challenges. Browsers expect **a single continuous file**—not disjointed chunks.
+
+For example, when you open a video or file in Google Drive:
+- It initially shows a loading spinner or placeholder.
+- Behind the scenes, it **downloads all the required chunks**, temporarily caches them locally, **reconstructs the complete file**, and then streams or displays it in-browser.
+- Once playback or viewing is done, the temporary file/cache is removed.
+
+This process is necessary because:
+- **Browsers can’t handle chunked storage directly.**
+- Full file reconstruction is required for standard video players, PDF viewers, image renderers, etc.
+
+Thus, although we store files as chunks for efficient syncing and deduplication, to **support seamless in-browser previewing**, the Dropbox client must:
+- Download all chunks when the file is accessed.
+- econstruct and serve a unified file to the browser layer.
+
+This ensures the user experience remains fluid, while still leveraging chunk-based storage behind the scenes.
 
 ##  Considerations
 - CDN Not Required:
