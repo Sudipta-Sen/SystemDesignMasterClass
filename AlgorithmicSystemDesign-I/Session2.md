@@ -316,3 +316,18 @@ This ensures the user experience remains fluid, while still leveraging chunk-bas
 - Cache Management:
     - Temporarily store and reconstruct full files on client during lazy access
     - Delete after use
+
+- What is a Chunk?
+
+    A chunk is a fixed-size segment of a file—commonly used in storage systems to break large files into smaller, manageable parts for efficient syncing, deduplication, and transfer.
+
+    But are chunks **physically separate files?** -->  Not necessarily.
+
+    Chunks don’t always exist as standalone files on disk or in storage. For example, if we define a chunk size as 4MB, then a large file can be divided logically like this:
+    - **Chunk 1:** Byte offset 0 to 4MB - 1
+    - **Chunk 2:** Byte offset 4MB to 8MB - 1
+    - and so on...
+
+    This means that chunks can simply be **byte ranges within a larger file**, and don’t have to be physically separated. The system can extract or reference these ranges as needed during upload, download, or reconstruction.
+
+    This logical chunking allows flexibility without needing to split or store each chunk as a separate file.
