@@ -214,6 +214,17 @@ Moving or zooming around Google Maps is like flipping bits of a GeoHash.
 - Each region = "squad"
 - Geohash encoding gives us a compact 1D representation of 2D locations
 
+#### Steps to Handle Location Change in B+ Tree
+
+Maintain an Auxiliary Map `user_id -> location`
+
+- Keep **a separate hash map** or database table mapping `user_id → last_known_location`
+- When a user updates their location:
+    - Look up the old location using this map.
+    - Delete the old `(old_location, user_id)` entry from the B+ tree.
+    - Insert the new `(new_location, user_id)` entry into the B+ tree.
+    - Update the hash map with the new location.
+
 ####  Final Insight
 - The **Geohash** is a 1D encoding of 2D (or even 3D) coordinates.
 - It’s an incredibly **simple yet powerful** representation that allows us to use **prefix matching** to search nearby regions using a Trie.
