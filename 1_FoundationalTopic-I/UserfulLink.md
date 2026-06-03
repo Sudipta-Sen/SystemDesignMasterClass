@@ -1,0 +1,32 @@
+# Links
+
+## Pre-Reads Session 1
+- [What is CDN?](https://www.akamai.com/our-thinking/cdn/what-is-a-cdn)
+- [What are KV Stores?](https://en.wikipedia.org/wiki/Key%E2%80%93value_database)
+- [What are WebSockets?](https://www.twilio.com/docs/glossary/what-are-websockets)
+- [What is a Load Balancer?](https://www.digitalocean.com/community/tutorials/what-is-load-balancing)
+- [What is a Message Broker?](https://tsh.io/blog/message-broker/)
+- [Heartbeats in Distributed Systems](https://en.wikipedia.org/wiki/Heartbeat_(computing))
+- [Everything you need to know about REST](https://www.youtube.com/watch?v=uFGJVQvR59A)
+- [Synchronous and Asynchronous Communication between Microservices](https://www.youtube.com/watch?v=ewUw0sUxHI4)
+- [Designing a good database schema](https://medium.com/@kimtnguyen/relational-database-schema-design-overview-70e447ff66f9)
+- [Minimalistic blocking bounded queue in C++](https://morestina.net/blog/1400/minimalistic-blocking-bounded-queue-for-c)
+- [Blocking Queue in Go](https://johannes-weigend.medium.com/concurrency-in-go-32a8b1e35337)
+- [Introduction to AWS DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html)
+- [Introduction to Redis](https://redis.io/docs/about/)
+
+## Post-Read of Session 1
+
+- [How to approach System Design?](https://youtu.be/1r9bPisYaOQ)
+- [Datetime vs Timestamp datatype in databases Which one is better and when?](https://youtu.be/zrl_odkY5tI?si=g3N53em0NnPF0Ggv)
+- [How to pick the right string column datatype in SQL database CHAR vs VARCHAR vs TEXT](https://youtu.be/wOAfvwDxsTo)
+- [What happens when you type a URL into your browser?](https://youtu.be/4lb3dAtKcJo)
+- [Understanding Proxy, Forward Proxy, and Reverse Proxy](https://youtu.be/HrG0MHkSsCA)
+- [How DNS really works and How it scales infinitely?](https://youtu.be/g_gKI2HCElk)
+- [How Giphy uses CDN to serve 10 billion GIFs every day](https://youtu.be/-bo7oVejgRM?si=rqurMS23rIwiYMBW)
+- [How to write a Concurrent Thread-safe Queue from scratch?](https://youtu.be/oYoVx8ZuvTw)
+- [How to write efficient and fair multi-threaded programs?](https://youtu.be/2PjlaUnrAMQ)
+- [Server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events)
+- [SocketIO Chat Platform](https://github.com/socketio/socket.io-chat-platform)
+- [Ep 2 - Introduction to CRDTs -  Conflict-free Replicated Data Types - with @VipulVaibhaw](https://youtube.com/watch?v=Paau_t0aZKw)
+- [ProxySQL Documentation](https://proxysql.com/documentation/)
