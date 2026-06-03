@@ -1,6 +1,4 @@
-# Links
-
-## Pre-Reads Session 1
+# Pre-Reads
 - [What is CDN?](https://www.akamai.com/our-thinking/cdn/what-is-a-cdn)
 - [What are KV Stores?](https://en.wikipedia.org/wiki/Key%E2%80%93value_database)
 - [What are WebSockets?](https://www.twilio.com/docs/glossary/what-are-websockets)
@@ -15,7 +13,7 @@
 - [Introduction to AWS DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html)
 - [Introduction to Redis](https://redis.io/docs/about/)
 
-## Post-Read of Session 1
+# Post-Read
 
 - [How to approach System Design?](https://youtu.be/1r9bPisYaOQ)
 - [Datetime vs Timestamp datatype in databases Which one is better and when?](https://youtu.be/zrl_odkY5tI?si=g3N53em0NnPF0Ggv)
